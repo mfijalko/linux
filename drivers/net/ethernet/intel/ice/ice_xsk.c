@@ -161,6 +161,7 @@ static int ice_qp_dis(struct ice_vsi *vsi, u16 q_idx)
 	struct ice_tx_ring *tx_ring;
 	struct ice_rx_ring *rx_ring;
 	int timeout = 50;
+	int fail = 0;
 	int err;
 
 	if (q_idx >= vsi->num_rxq || q_idx >= vsi->num_txq)
@@ -186,21 +187,21 @@ static int ice_qp_dis(struct ice_vsi *vsi, u16 q_idx)
 
 	ice_fill_txq_meta(vsi, tx_ring, &txq_meta);
 	err = ice_vsi_stop_tx_ring(vsi, ICE_NO_RESET, 0, tx_ring, &txq_meta);
-	if (err)
-		return err;
+	if (!fail)
+		fail = err;
 
 	memset(&txq_meta, 0, sizeof(txq_meta));
 	ice_fill_txq_meta(vsi, xdp_ring, &txq_meta);
 	err = ice_vsi_stop_tx_ring(vsi, ICE_NO_RESET, 0, xdp_ring,
 				   &txq_meta);
-	if (err)
-		return err;
+	if (!fail)
+		fail = err;
 
 	ice_vsi_ctrl_one_rx_ring(vsi, false, q_idx, false);
 	ice_qp_clean_rings(vsi, q_idx);
 	ice_qp_reset_stats(vsi, q_idx);
 
-	return 0;
+	return fail;
 }
 
 /**
@@ -214,28 +215,29 @@ static int ice_qp_ena(struct ice_vsi *vsi, u16 q_idx)
 {
 	struct ice_tx_ring *xdp_ring = vsi->xdp_rings[q_idx];
 	struct ice_q_vector *q_vector;
+	int fail = 0;
 	int err;
 
 	err = ice_vsi_cfg_single_txq(vsi, vsi->tx_rings, q_idx);
-	if (err)
-		return err;
+	if (!fail)
+		fail = err;
 
 	err = ice_vsi_cfg_single_txq(vsi, vsi->xdp_rings, q_idx);
-	if (err)
-		return err;
+	if (!fail)
+		fail = err;
 	ice_set_ring_xdp(xdp_ring);
 	ice_tx_xsk_pool(vsi, q_idx);
 
 	err = ice_vsi_cfg_single_rxq(vsi, q_idx);
-	if (err)
-		return err;
+	if (!fail)
+		fail = err;
 
 	q_vector = vsi->rx_rings[q_idx]->q_vector;
 	ice_qvec_cfg_msix(vsi, q_vector);
 
 	err = ice_vsi_ctrl_one_rx_ring(vsi, true, q_idx, true);
-	if (err)
-		return err;
+	if (!fail)
+		fail = err;
 
 	ice_qvec_toggle_napi(vsi, q_vector, true);
 	ice_qvec_ena_irq(vsi, q_vector);
@@ -243,7 +245,7 @@ static int ice_qp_ena(struct ice_vsi *vsi, u16 q_idx)
 	netif_tx_start_queue(netdev_get_tx_queue(vsi->netdev, q_idx));
 	clear_bit(ICE_CFG_BUSY, vsi->state);
 
-	return 0;
+	return fail;
 }
 
 /**
@@ -367,8 +369,7 @@ int ice_xsk_pool_setup(struct ice_vsi *vsi, struct xsk_buff_pool *pool, u16 qid)
 
 	if (qid >= vsi->num_rxq || qid >= vsi->num_txq) {
 		netdev_err(vsi->netdev, "Please use queue id in scope of combined queues count\n");
-		pool_failure = -EINVAL;
-		goto failure;
+		return -EINVAL;
 	}
 
 	if_running = netif_running(vsi->netdev) && ice_is_xdp_ena_vsi(vsi);
@@ -379,34 +380,35 @@ int ice_xsk_pool_setup(struct ice_vsi *vsi, struct xsk_buff_pool *pool, u16 qid)
 		ret = ice_qp_dis(vsi, qid);
 		if (ret) {
 			netdev_err(vsi->netdev, "ice_qp_dis error = %d\n", ret);
-			goto xsk_pool_if_up;
+			pool_failure = ret;
 		}
 
-		ret = ice_realloc_rx_xdp_bufs(rx_ring, pool_present);
-		if (ret)
-			goto xsk_pool_if_up;
+		if (!pool_failure) {
+			ret = ice_realloc_rx_xdp_bufs(rx_ring, pool_present);
+			if (ret)
+				pool_failure = ret;
+		}
 	}
 
-	pool_failure = pool_present ? ice_xsk_pool_enable(vsi, pool, qid) :
-				      ice_xsk_pool_disable(vsi, qid);
+	if (!pool_failure)
+		pool_failure = pool_present ?
+			ice_xsk_pool_enable(vsi, pool, qid) :
+			ice_xsk_pool_disable(vsi, qid);
 
-xsk_pool_if_up:
 	if (if_running) {
 		ret = ice_qp_ena(vsi, qid);
-		if (!ret && pool_present)
+		pool_failure = ret;
+		if (!pool_failure)
 			napi_schedule(&vsi->rx_rings[qid]->xdp_ring->q_vector->napi);
-		else if (ret)
+		else
 			netdev_err(vsi->netdev, "ice_qp_ena error = %d\n", ret);
 	}
 
-failure:
-	if (pool_failure) {
+	if (pool_failure)
 		netdev_err(vsi->netdev, "Could not %sable buffer pool, error = %d\n",
 			   pool_present ? "en" : "dis", pool_failure);
-		return pool_failure;
-	}
 
-	return ret;
+	return pool_failure;
 }
 
 /**
