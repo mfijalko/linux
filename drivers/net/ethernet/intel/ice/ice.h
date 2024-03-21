@@ -755,15 +755,17 @@ static inline void ice_set_ring_xdp(struct ice_tx_ring *ring)
  * Returns a pointer to xsk_buff_pool structure if there is a buffer pool
  * present, NULL otherwise.
  */
-static inline struct xsk_buff_pool *ice_xsk_pool(struct ice_rx_ring *ring)
+static inline void ice_xsk_pool(struct ice_rx_ring *ring)
 {
 	struct ice_vsi *vsi = ring->vsi;
 	u16 qid = ring->q_index;
 
-	if (!ice_is_xdp_ena_vsi(vsi) || !test_bit(qid, vsi->af_xdp_zc_qps))
-		return NULL;
+	if (!ice_is_xdp_ena_vsi(vsi) || !test_bit(qid, vsi->af_xdp_zc_qps)) {
+		WRITE_ONCE(ring->xsk_pool, NULL);
+		return;
+	}
 
-	return xsk_get_pool_from_qid(vsi->netdev, qid);
+	WRITE_ONCE(ring->xsk_pool, xsk_get_pool_from_qid(vsi->netdev, qid));
 }
 
 /**
@@ -789,11 +791,11 @@ static inline void ice_tx_xsk_pool(struct ice_vsi *vsi, u16 qid)
 		return;
 
 	if (!ice_is_xdp_ena_vsi(vsi) || !test_bit(qid, vsi->af_xdp_zc_qps)) {
-		ring->xsk_pool = NULL;
+		WRITE_ONCE(ring->xsk_pool, NULL);
 		return;
 	}
 
-	ring->xsk_pool = xsk_get_pool_from_qid(vsi->netdev, qid);
+	WRITE_ONCE(ring->xsk_pool, xsk_get_pool_from_qid(vsi->netdev, qid));
 }
 
 /**
