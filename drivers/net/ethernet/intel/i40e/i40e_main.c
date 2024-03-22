@@ -13359,10 +13359,8 @@ static void i40e_queue_pair_reset_stats(struct i40e_vsi *vsi, int queue_pair)
 	       sizeof(vsi->rx_rings[queue_pair]->rx_stats));
 	memset(&vsi->tx_rings[queue_pair]->stats, 0,
 	       sizeof(vsi->tx_rings[queue_pair]->stats));
-	if (i40e_enabled_xdp_vsi(vsi)) {
-		memset(&vsi->xdp_rings[queue_pair]->stats, 0,
-		       sizeof(vsi->xdp_rings[queue_pair]->stats));
-	}
+	memset(&vsi->xdp_rings[queue_pair]->stats, 0,
+	       sizeof(vsi->xdp_rings[queue_pair]->stats));
 }
 
 /**
@@ -13373,13 +13371,11 @@ static void i40e_queue_pair_reset_stats(struct i40e_vsi *vsi, int queue_pair)
 static void i40e_queue_pair_clean_rings(struct i40e_vsi *vsi, int queue_pair)
 {
 	i40e_clean_tx_ring(vsi->tx_rings[queue_pair]);
-	if (i40e_enabled_xdp_vsi(vsi)) {
-		/* Make sure that in-progress ndo_xdp_xmit calls are
-		 * completed.
-		 */
-		synchronize_rcu();
-		i40e_clean_tx_ring(vsi->xdp_rings[queue_pair]);
-	}
+	/* Make sure that in-progress ndo_xdp_xmit calls are
+	 * completed.
+	 */
+	synchronize_rcu();
+	i40e_clean_tx_ring(vsi->xdp_rings[queue_pair]);
 	i40e_clean_rx_ring(vsi->rx_rings[queue_pair]);
 }
 
@@ -13445,9 +13441,6 @@ static int i40e_queue_pair_toggle_rings(struct i40e_vsi *vsi, int queue_pair,
 	 */
 	if (!enable)
 		mdelay(50);
-
-	if (!i40e_enabled_xdp_vsi(vsi))
-		return ret;
 
 	ret = i40e_control_wait_tx_q(vsi->seid, pf,
 				     pf_q + vsi->alloc_queue_pairs,
