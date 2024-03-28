@@ -8,6 +8,30 @@
 #include "xdp_umem.h"
 #include "xsk.h"
 
+void xp_add_xsk_rx(struct xsk_buff_pool *pool, struct xdp_sock *xs)
+{
+	unsigned long flags;
+
+	if (!xs->rx)
+		return;
+
+	spin_lock_irqsave(&pool->xsk_tx_list_lock, flags);
+	list_add_rcu(&xs->rx_list, &pool->xsk_rx_list);
+	spin_unlock_irqrestore(&pool->xsk_tx_list_lock, flags);
+}
+
+void xp_del_xsk_rx(struct xsk_buff_pool *pool, struct xdp_sock *xs)
+{
+	unsigned long flags;
+
+	if (!xs->rx)
+		return;
+
+	spin_lock_irqsave(&pool->xsk_tx_list_lock, flags);
+	list_del_rcu(&xs->rx_list);
+	spin_unlock_irqrestore(&pool->xsk_tx_list_lock, flags);
+}
+
 void xp_add_xsk(struct xsk_buff_pool *pool, struct xdp_sock *xs)
 {
 	unsigned long flags;
@@ -90,12 +114,15 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 	INIT_LIST_HEAD(&pool->free_list);
 	INIT_LIST_HEAD(&pool->xskb_list);
 	INIT_LIST_HEAD(&pool->xsk_tx_list);
+	INIT_LIST_HEAD(&pool->xsk_rx_list);
 	spin_lock_init(&pool->xsk_tx_list_lock);
 	spin_lock_init(&pool->cq_lock);
 	refcount_set(&pool->users, 1);
 
 	pool->fq = xs->fq_tmp;
 	pool->cq = xs->cq_tmp;
+	pool->rx = !!xs->rx;
+	pool->tx = !!xs->tx;
 
 	for (i = 0; i < pool->free_heads_cnt; i++) {
 		xskb = &pool->heads[i];
@@ -137,7 +164,7 @@ void xp_fill_cb(struct xsk_buff_pool *pool, struct xsk_cb_desc *desc)
 }
 EXPORT_SYMBOL(xp_fill_cb);
 
-static void xp_disable_drv_zc(struct xsk_buff_pool *pool)
+static void xp_disable_drv_zc(struct xsk_buff_pool *pool, int flags)
 {
 	struct netdev_bpf bpf;
 	int err;
@@ -148,6 +175,7 @@ static void xp_disable_drv_zc(struct xsk_buff_pool *pool)
 		bpf.command = XDP_SETUP_XSK_POOL;
 		bpf.xsk.pool = NULL;
 		bpf.xsk.queue_id = pool->queue_id;
+		bpf.xsk.flags = flags;
 
 		err = pool->netdev->netdev_ops->ndo_bpf(pool->netdev, &bpf);
 
@@ -180,6 +208,7 @@ int xp_assign_dev(struct xsk_buff_pool *pool,
 
 	pool->netdev = netdev;
 	pool->queue_id = queue_id;
+
 	err = xsk_reg_pool_at_qid(netdev, pool, queue_id);
 	if (err)
 		return err;
@@ -214,6 +243,8 @@ int xp_assign_dev(struct xsk_buff_pool *pool,
 	bpf.command = XDP_SETUP_XSK_POOL;
 	bpf.xsk.pool = pool;
 	bpf.xsk.queue_id = queue_id;
+	bpf.xsk.flags = 0;
+	pool->umem->zc = true;
 
 	err = netdev->netdev_ops->ndo_bpf(netdev, &bpf);
 	if (err)
@@ -224,16 +255,18 @@ int xp_assign_dev(struct xsk_buff_pool *pool,
 		err = -EINVAL;
 		goto err_unreg_xsk;
 	}
-	pool->umem->zc = true;
 	return 0;
 
 err_unreg_xsk:
-	xp_disable_drv_zc(pool);
+	xp_disable_drv_zc(pool, (RX_CHANGED | TX_CHANGED));
 err_unreg_pool:
+	pool->umem->zc = false;
 	if (!force_zc)
 		err = 0; /* fallback to copy mode */
 	if (err) {
-		xsk_clear_pool_at_qid(netdev, queue_id);
+		pool->tx = false;
+		pool->rx = false;
+		xsk_clear_pool_at_qid(netdev, queue_id, (RX_CHANGED | TX_CHANGED));
 		dev_put(netdev);
 	}
 	return err;
@@ -261,8 +294,9 @@ void xp_clear_dev(struct xsk_buff_pool *pool)
 	if (!pool->netdev)
 		return;
 
-	xp_disable_drv_zc(pool);
-	xsk_clear_pool_at_qid(pool->netdev, pool->queue_id);
+	xp_disable_drv_zc(pool, (RX_CHANGED | TX_CHANGED));
+	xsk_clear_pool_at_qid(pool->netdev, pool->queue_id,
+				(RX_CHANGED | TX_CHANGED));
 	dev_put(pool->netdev);
 	pool->netdev = NULL;
 }
@@ -271,6 +305,9 @@ static void xp_release_deferred(struct work_struct *work)
 {
 	struct xsk_buff_pool *pool = container_of(work, struct xsk_buff_pool,
 						  work);
+
+	if (work_pending(&pool->work_no_destroy))
+		cancel_work_sync(&pool->work_no_destroy);
 
 	rtnl_lock();
 	xp_clear_dev(pool);
@@ -295,18 +332,57 @@ void xp_get_pool(struct xsk_buff_pool *pool)
 	refcount_inc(&pool->users);
 }
 
+static int xp_pool_change(struct xsk_buff_pool *pool)
+{
+	int flags = 0;
+
+	if (!pool->rx && xsk_get_rx_pool_from_qid(pool->netdev, pool->queue_id))
+		flags |= RX_CHANGED;
+	if (!pool->tx && xsk_get_tx_pool_from_qid(pool->netdev, pool->queue_id))
+		flags |= RX_CHANGED;
+
+	return flags;
+}
+
+static void xp_clear_async(struct work_struct *work)
+{
+	struct xsk_buff_pool *pool = container_of(work, struct xsk_buff_pool,
+						  work_no_destroy);
+	int flags;
+
+	if (!pool->netdev)
+		return;
+
+	rtnl_lock();
+	flags = xp_pool_change(pool);
+	if (flags) {
+		xp_disable_drv_zc(pool, flags);
+		xsk_clear_pool_at_qid(pool->netdev, pool->queue_id, flags);
+	}
+	rtnl_unlock();
+}
+
 bool xp_put_pool(struct xsk_buff_pool *pool)
 {
+	bool refcnt;
+
 	if (!pool)
 		return false;
 
-	if (refcount_dec_and_test(&pool->users)) {
+	refcnt = refcount_dec_and_test(&pool->users);
+
+	if (refcnt) {
 		INIT_WORK(&pool->work, xp_release_deferred);
 		schedule_work(&pool->work);
-		return true;
+	} else {
+		if ((pool->netdev->features & NETDEV_XDP_ACT_XSK_ASYM_Q) &&
+		    pool->umem->zc) {
+			INIT_WORK(&pool->work_no_destroy, xp_clear_async);
+			schedule_work(&pool->work_no_destroy);
+		}
 	}
 
-	return false;
+	return refcnt;
 }
 
 static struct xsk_dma_map *xp_find_dma_map(struct xsk_buff_pool *pool)

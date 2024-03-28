@@ -114,12 +114,17 @@ static int ice_vsi_alloc_arrays(struct ice_vsi *vsi)
 	if (!vsi->q_vectors)
 		goto err_vectors;
 
-	vsi->af_xdp_zc_qps = bitmap_zalloc(max_t(int, vsi->alloc_txq, vsi->alloc_rxq), GFP_KERNEL);
+	vsi->af_xdp_zc_qps = bitmap_zalloc(vsi->alloc_rxq, GFP_KERNEL);
 	if (!vsi->af_xdp_zc_qps)
 		goto err_zc_qps;
+	vsi->af_xdp_zc_qps_tx = bitmap_zalloc(vsi->alloc_txq, GFP_KERNEL);
+	if (!vsi->af_xdp_zc_qps_tx)
+		goto err_zc_qps_tx;
 
 	return 0;
 
+err_zc_qps_tx:
+	bitmap_free(vsi->af_xdp_zc_qps);
 err_zc_qps:
 	devm_kfree(dev, vsi->q_vectors);
 err_vectors:
@@ -311,6 +316,8 @@ static void ice_vsi_free_arrays(struct ice_vsi *vsi)
 
 	bitmap_free(vsi->af_xdp_zc_qps);
 	vsi->af_xdp_zc_qps = NULL;
+	bitmap_free(vsi->af_xdp_zc_qps_tx);
+	vsi->af_xdp_zc_qps_tx = NULL;
 	/* free the ring and vector containers */
 	devm_kfree(dev, vsi->q_vectors);
 	vsi->q_vectors = NULL;

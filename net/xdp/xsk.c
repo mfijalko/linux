@@ -100,20 +100,43 @@ EXPORT_SYMBOL(xsk_uses_need_wakeup);
 struct xsk_buff_pool *xsk_get_pool_from_qid(struct net_device *dev,
 					    u16 queue_id)
 {
+	struct xsk_buff_pool *pool = NULL;
 	if (queue_id < dev->real_num_rx_queues)
-		return dev->_rx[queue_id].pool;
+		pool = dev->_rx[queue_id].pool;
+
+	if (!pool)
+		if (queue_id < dev->real_num_tx_queues)
+			pool = dev->_tx[queue_id].pool;
+
+	return pool;
+}
+EXPORT_SYMBOL(xsk_get_pool_from_qid);
+
+struct xsk_buff_pool *xsk_get_tx_pool_from_qid(struct net_device *dev,
+						u16 queue_id)
+{
 	if (queue_id < dev->real_num_tx_queues)
 		return dev->_tx[queue_id].pool;
 
 	return NULL;
 }
-EXPORT_SYMBOL(xsk_get_pool_from_qid);
+EXPORT_SYMBOL(xsk_get_tx_pool_from_qid);
 
-void xsk_clear_pool_at_qid(struct net_device *dev, u16 queue_id)
+struct xsk_buff_pool *xsk_get_rx_pool_from_qid(struct net_device *dev,
+					    u16 queue_id)
 {
-	if (queue_id < dev->num_rx_queues)
+	if (queue_id < dev->real_num_rx_queues)
+		return dev->_rx[queue_id].pool;
+
+	return NULL;
+}
+EXPORT_SYMBOL(xsk_get_rx_pool_from_qid);
+
+void xsk_clear_pool_at_qid(struct net_device *dev, u16 queue_id, int flags)
+{
+	if (flags & RX_CHANGED)
 		dev->_rx[queue_id].pool = NULL;
-	if (queue_id < dev->num_tx_queues)
+	if (flags & TX_CHANGED)
 		dev->_tx[queue_id].pool = NULL;
 }
 
@@ -129,9 +152,9 @@ int xsk_reg_pool_at_qid(struct net_device *dev, struct xsk_buff_pool *pool,
 			      dev->real_num_tx_queues))
 		return -EINVAL;
 
-	if (queue_id < dev->real_num_rx_queues)
+	if (queue_id < dev->real_num_rx_queues && pool->rx)
 		dev->_rx[queue_id].pool = pool;
-	if (queue_id < dev->real_num_tx_queues)
+	if (queue_id < dev->real_num_tx_queues && pool->tx)
 		dev->_tx[queue_id].pool = pool;
 
 	return 0;
@@ -921,16 +944,18 @@ static int __xsk_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len
 	if (unlikely(!xs->tx))
 		return -ENOBUFS;
 
+	pool = xs->pool;
 	if (sk_can_busy_loop(sk)) {
-		if (xs->zc)
-			__sk_mark_napi_id_once(sk, xsk_pool_get_napi_id(xs->pool));
+		/* check if Rx is on, otherwise driver didn't set xdp_rxq_infos
+		 */
+		if (xs->zc && pool->rx)
+			__sk_mark_napi_id_once(sk, xsk_pool_get_napi_id(pool));
 		sk_busy_loop(sk, 1); /* only support non-blocking sockets */
 	}
 
 	if (xs->zc && xsk_no_wakeup(sk))
 		return 0;
 
-	pool = xs->pool;
 	if (pool->cached_need_wakeup & XDP_WAKEUP_TX) {
 		if (xs->zc)
 			return xsk_wakeup(xs, XDP_WAKEUP_TX);
@@ -1048,6 +1073,14 @@ static void xsk_unbind_dev(struct xdp_sock *xs)
 
 	/* Wait for driver to stop using the xdp socket. */
 	xp_del_xsk(xs->pool, xs);
+	xp_del_xsk_rx(xs->pool, xs);
+
+	if (xs->pool) {
+		if (list_empty(&xs->pool->xsk_tx_list))
+			xs->pool->tx = false;
+		if (list_empty(&xs->pool->xsk_rx_list))
+			xs->pool->rx = false;
+	}
 	synchronize_net();
 	dev_put(dev);
 }
@@ -1253,6 +1286,9 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 				goto out_unlock;
 			}
 		} else {
+			struct netdev_bpf bpf;
+			int flags = 0;
+
 			/* Share the buffer pool with the other socket. */
 			if (xs->fq_tmp || xs->cq_tmp) {
 				/* Do not allow setting your own fq or cq. */
@@ -1263,6 +1299,33 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 
 			xp_get_pool(umem_xs->pool);
 			xs->pool = umem_xs->pool;
+
+			if (xs->tx && !xs->pool->tx) {
+				xs->pool->tx = true;
+				dev->_tx[qid].pool = xs->pool;
+				flags |= TX_CHANGED;
+			}
+
+			if (xs->rx && !xs->pool->rx) {
+				xs->pool->rx = true;
+				dev->_rx[qid].pool = xs->pool;
+				flags |= RX_CHANGED;
+			}
+			if ((dev->features & NETDEV_XDP_ACT_XSK_ASYM_Q) &&
+			    umem_xs->zc && flags) {
+				bpf.command = XDP_SETUP_XSK_POOL;
+				bpf.xsk.pool = xs->pool;
+				bpf.xsk.queue_id = qid;
+				bpf.xsk.flags = flags;
+
+				err = dev->netdev_ops->ndo_bpf(dev, &bpf);
+				if (err) {
+					xp_put_pool(xs->pool);
+					xs->pool = NULL;
+					sockfd_put(sock);
+					goto out_unlock;
+				}
+			}
 
 			/* If underlying shared umem was created without Tx
 			 * ring, allocate Tx descs array that Tx batching API
@@ -1310,6 +1373,7 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	xs->sg = !!(xs->umem->flags & XDP_UMEM_SG_FLAG);
 	xs->queue_id = qid;
 	xp_add_xsk(xs->pool, xs);
+	xp_add_xsk_rx(xs->pool, xs);
 
 out_unlock:
 	if (err) {

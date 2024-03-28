@@ -962,6 +962,7 @@ struct netdev_bpf {
 		struct {
 			struct xsk_buff_pool *pool;
 			u16 queue_id;
+			int flags;
 		} xsk;
 	};
 };

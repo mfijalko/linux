@@ -263,15 +263,19 @@ static int ice_qp_ena(struct ice_vsi *vsi, u16 q_idx)
  *
  * Returns 0 on success, negative on failure
  */
-static int ice_xsk_pool_disable(struct ice_vsi *vsi, u16 qid)
+static int ice_xsk_pool_disable(struct ice_vsi *vsi, u16 qid, int flags)
 {
-	struct xsk_buff_pool *pool = xsk_get_pool_from_qid(vsi->netdev, qid);
+	struct xsk_buff_pool *pool = NULL;
 
-	if (!pool)
-		return -EINVAL;
+	if ((flags & TX_CHANGED))
+		clear_bit(qid, vsi->af_xdp_zc_qps_tx);
+	if (flags & RX_CHANGED)
+		clear_bit(qid, vsi->af_xdp_zc_qps);
 
-	clear_bit(qid, vsi->af_xdp_zc_qps);
-	xsk_pool_dma_unmap(pool, ICE_RX_DMA_ATTR);
+	pool = xsk_get_pool_from_qid(vsi->netdev, qid);
+	if (pool && !test_bit(qid, vsi->af_xdp_zc_qps) &&
+		!test_bit(qid, vsi->af_xdp_zc_qps_tx))
+		xsk_pool_dma_unmap(pool, ICE_RX_DMA_ATTR);
 
 	return 0;
 }
@@ -296,67 +300,16 @@ ice_xsk_pool_enable(struct ice_vsi *vsi, struct xsk_buff_pool *pool, u16 qid)
 	    qid >= vsi->netdev->real_num_tx_queues)
 		return -EINVAL;
 
-	err = xsk_pool_dma_map(pool, ice_pf_to_dev(vsi->back),
-			       ICE_RX_DMA_ATTR);
-	if (err)
-		return err;
+	if (pool->rx && pool->umem->zc)
+		set_bit(qid, vsi->af_xdp_zc_qps);
+	if (pool->tx && pool->umem->zc)
+		set_bit(qid, vsi->af_xdp_zc_qps_tx);
 
-	set_bit(qid, vsi->af_xdp_zc_qps);
-
-	return 0;
-}
-
-/**
- * ice_realloc_rx_xdp_bufs - reallocate for either XSK or normal buffer
- * @rx_ring: Rx ring
- * @pool_present: is pool for XSK present
- *
- * Try allocating memory and return ENOMEM, if failed to allocate.
- * If allocation was successful, substitute buffer with allocated one.
- * Returns 0 on success, negative on failure
- */
-static int
-ice_realloc_rx_xdp_bufs(struct ice_rx_ring *rx_ring, bool pool_present)
-{
-	size_t elem_size = pool_present ? sizeof(*rx_ring->xdp_buf) :
-					  sizeof(*rx_ring->rx_buf);
-	void *sw_ring = kcalloc(rx_ring->count, elem_size, GFP_KERNEL);
-
-	if (!sw_ring)
-		return -ENOMEM;
-
-	if (pool_present) {
-		kfree(rx_ring->rx_buf);
-		rx_ring->rx_buf = NULL;
-		rx_ring->xdp_buf = sw_ring;
-	} else {
-		kfree(rx_ring->xdp_buf);
-		rx_ring->xdp_buf = NULL;
-		rx_ring->rx_buf = sw_ring;
-	}
-
-	return 0;
-}
-
-/**
- * ice_realloc_zc_buf - reallocate XDP ZC queue pairs
- * @vsi: Current VSI
- * @zc: is zero copy set
- *
- * Reallocate buffer for rx_rings that might be used by XSK.
- * XDP requires more memory, than rx_buf provides.
- * Returns 0 on success, negative on failure
- */
-int ice_realloc_zc_buf(struct ice_vsi *vsi, bool zc)
-{
-	struct ice_rx_ring *rx_ring;
-	unsigned long q;
-
-	for_each_set_bit(q, vsi->af_xdp_zc_qps,
-			 max_t(int, vsi->alloc_txq, vsi->alloc_rxq)) {
-		rx_ring = vsi->rx_rings[q];
-		if (ice_realloc_rx_xdp_bufs(rx_ring, zc))
-			return -ENOMEM;
+	if (!pool->dma_pages) {
+		err = xsk_pool_dma_map(pool, ice_pf_to_dev(vsi->back),
+				       ICE_RX_DMA_ATTR);
+		if (err)
+			return err;
 	}
 
 	return 0;
@@ -370,7 +323,8 @@ int ice_realloc_zc_buf(struct ice_vsi *vsi, bool zc)
  *
  * Returns 0 on success, negative on failure
  */
-int ice_xsk_pool_setup(struct ice_vsi *vsi, struct xsk_buff_pool *pool, u16 qid)
+int ice_xsk_pool_setup(struct ice_vsi *vsi, struct xsk_buff_pool *pool, u16 qid,
+		       int flags)
 {
 	bool if_running, pool_present = !!pool;
 	int ret = 0, pool_failure = 0;
@@ -383,31 +337,24 @@ int ice_xsk_pool_setup(struct ice_vsi *vsi, struct xsk_buff_pool *pool, u16 qid)
 	if_running = netif_running(vsi->netdev) && ice_is_xdp_ena_vsi(vsi);
 
 	if (if_running) {
-		struct ice_rx_ring *rx_ring = vsi->rx_rings[qid];
-
 		ret = ice_qp_dis(vsi, qid);
 		if (ret) {
 			netdev_err(vsi->netdev, "ice_qp_dis error = %d\n", ret);
 			pool_failure = ret;
-		}
-
-		if (!pool_failure) {
-			ret = ice_realloc_rx_xdp_bufs(rx_ring, pool_present);
-			if (ret)
-				pool_failure = ret;
 		}
 	}
 
 	if (!pool_failure)
 		pool_failure = pool_present ?
 			ice_xsk_pool_enable(vsi, pool, qid) :
-			ice_xsk_pool_disable(vsi, qid);
+			ice_xsk_pool_disable(vsi, qid, flags);
 
 	if (if_running) {
 		ret = ice_qp_ena(vsi, qid);
-		pool_failure = ret;
+		if (ret)
+			pool_failure = ret;
 		if (!pool_failure)
-			napi_schedule(&vsi->rx_rings[qid]->xdp_ring->q_vector->napi);
+			ice_xsk_wakeup(vsi->netdev, qid, 0);
 		else
 			netdev_err(vsi->netdev, "ice_qp_ena error = %d\n", ret);
 	}
@@ -893,6 +840,7 @@ int ice_clean_rx_irq_zc(struct ice_rx_ring *rx_ring, int budget)
 		if (++ntc == cnt)
 			ntc = 0;
 
+
 		if (ice_is_non_eop(rx_ring, rx_desc))
 			continue;
 
@@ -1104,8 +1052,10 @@ ice_xsk_wakeup(struct net_device *netdev, u32 queue_id,
 	struct ice_vsi *vsi = np->vsi;
 	struct ice_tx_ring *ring;
 
-	if (test_bit(ICE_VSI_DOWN, vsi->state) ||
-	    test_bit(ICE_CFG_BUSY, vsi->state))
+	/* don't check for BUSY bit as we call wakeup from setup pool path
+	 * where it is being held; reason for doing so is to find out a
+	 * vector with pool attached */
+	if (test_bit(ICE_VSI_DOWN, vsi->state))
 		return -ENETDOWN;
 
 	if (!ice_is_xdp_ena_vsi(vsi))
@@ -1116,8 +1066,16 @@ ice_xsk_wakeup(struct net_device *netdev, u32 queue_id,
 
 	ring = vsi->rx_rings[queue_id]->xdp_ring;
 
-	if (!READ_ONCE(ring->xsk_pool))
-		return -EINVAL;
+	if (!READ_ONCE(ring->xsk_pool)) {
+		struct ice_rx_ring *rx_ring;
+
+		rx_ring = vsi->rx_rings[queue_id];
+		if (!READ_ONCE(rx_ring->xsk_pool))
+			return -EINVAL;
+		q_vector = rx_ring->q_vector;
+	} else {
+		q_vector = ring->q_vector;
+	}
 
 	/* The idea here is that if NAPI is running, mark a miss, so
 	 * it will run again. If not, trigger an interrupt and
@@ -1125,7 +1083,6 @@ ice_xsk_wakeup(struct net_device *netdev, u32 queue_id,
 	 * scheduled here, the interrupt affinity would not be
 	 * honored.
 	 */
-	q_vector = ring->q_vector;
 	if (!napi_if_scheduled_mark_missed(&q_vector->napi))
 		ice_trigger_sw_intr(&vsi->back->hw, q_vector);
 
@@ -1143,7 +1100,12 @@ bool ice_xsk_any_rx_ring_ena(struct ice_vsi *vsi)
 	int i;
 
 	ice_for_each_rxq(vsi, i) {
-		if (xsk_get_pool_from_qid(vsi->netdev, i))
+		if (xsk_get_rx_pool_from_qid(vsi->netdev, i))
+			return true;
+	}
+
+	ice_for_each_txq(vsi, i) {
+		if (xsk_get_tx_pool_from_qid(vsi->netdev, i))
 			return true;
 	}
 

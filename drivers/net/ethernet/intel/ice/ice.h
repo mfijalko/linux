@@ -414,6 +414,7 @@ struct ice_vsi {
 	struct bpf_prog *xdp_prog;
 	struct ice_tx_ring **xdp_rings;	 /* XDP ring array */
 	unsigned long *af_xdp_zc_qps;	 /* tracks AF_XDP ZC enabled qps */
+	unsigned long *af_xdp_zc_qps_tx; /* tracks AF_XDP ZC enabled qps */
 	u16 num_xdp_txq;		 /* Used XDP queues */
 	u8 xdp_mapping_mode;		 /* ICE_MAP_MODE_[CONTIG|SCATTER] */
 
@@ -761,7 +762,7 @@ static inline void ice_xsk_pool(struct ice_rx_ring *ring)
 		return;
 	}
 
-	WRITE_ONCE(ring->xsk_pool, xsk_get_pool_from_qid(vsi->netdev, qid));
+	WRITE_ONCE(ring->xsk_pool, xsk_get_rx_pool_from_qid(vsi->netdev, qid));
 }
 
 /**
@@ -786,12 +787,12 @@ static inline void ice_tx_xsk_pool(struct ice_vsi *vsi, u16 qid)
 	if (!ring)
 		return;
 
-	if (!ice_is_xdp_ena_vsi(vsi) || !test_bit(qid, vsi->af_xdp_zc_qps)) {
+	if (!ice_is_xdp_ena_vsi(vsi) || !test_bit(qid, vsi->af_xdp_zc_qps_tx)) {
 		WRITE_ONCE(ring->xsk_pool, NULL);
 		return;
 	}
 
-	WRITE_ONCE(ring->xsk_pool, xsk_get_pool_from_qid(vsi->netdev, qid));
+	WRITE_ONCE(ring->xsk_pool, xsk_get_tx_pool_from_qid(vsi->netdev, qid));
 }
 
 /**

@@ -18,6 +18,9 @@ struct xsk_cb_desc {
 	u8 bytes;
 };
 
+#define RX_CHANGED BIT(0)
+#define TX_CHANGED BIT(1)
+
 #ifdef CONFIG_XDP_SOCKETS
 
 void xsk_tx_completed(struct xsk_buff_pool *pool, u32 nb_entries);
@@ -25,6 +28,10 @@ bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc);
 u32 xsk_tx_peek_release_desc_batch(struct xsk_buff_pool *pool, u32 max);
 void xsk_tx_release(struct xsk_buff_pool *pool);
 struct xsk_buff_pool *xsk_get_pool_from_qid(struct net_device *dev,
+					    u16 queue_id);
+struct xsk_buff_pool *xsk_get_rx_pool_from_qid(struct net_device *dev,
+					    u16 queue_id);
+struct xsk_buff_pool *xsk_get_tx_pool_from_qid(struct net_device *dev,
 					    u16 queue_id);
 void xsk_set_rx_need_wakeup(struct xsk_buff_pool *pool);
 void xsk_set_tx_need_wakeup(struct xsk_buff_pool *pool);
