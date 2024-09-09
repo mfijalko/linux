@@ -623,19 +623,37 @@ static u32 xp_alloc_reused(struct xsk_buff_pool *pool, struct xdp_buff **xdp, u3
 	return nb_entries;
 }
 
+static u32 xp_alloc_slow(struct xsk_buff_pool *pool, struct xdp_buff **xdp,
+			 u32 max)
+{
+	int i;
+
+	for (i = 0; i < max; i++) {
+		struct xdp_buff *buff;
+
+		buff = xp_alloc(pool);
+		if (unlikely(!buff))
+			goto abort_batch;
+		*xdp = buff;
+		xdp++;
+	}
+
+	return max;
+
+abort_batch:
+	for (int j = i; j >= 0; j--) {
+		xsk_buff_free(*xdp);
+		xdp--;
+	}
+	return 0;
+}
+
 u32 xp_alloc_batch(struct xsk_buff_pool *pool, struct xdp_buff **xdp, u32 max)
 {
 	u32 nb_entries1 = 0, nb_entries2;
 
-	if (unlikely(pool->dev && dma_dev_need_sync(pool->dev))) {
-		struct xdp_buff *buff;
-
-		/* Slow path */
-		buff = xp_alloc(pool);
-		if (buff)
-			*xdp = buff;
-		return !!buff;
-	}
+	if (unlikely(pool->dev && dma_dev_need_sync(pool->dev)))
+		return xp_alloc_slow(pool, xdp, max);
 
 	if (unlikely(pool->free_list_cnt)) {
 		nb_entries1 = xp_alloc_reused(pool, xdp, max);
