@@ -449,6 +449,9 @@ static u16 ice_fill_rx_descs(struct xsk_buff_pool *pool, struct xdp_buff **xdp,
 	u16 buffs;
 	int i;
 
+	if (unlikely(!xsk_buff_can_alloc(pool, count)))
+		return 0;
+
 	buffs = xsk_buff_alloc_batch(pool, xdp, count);
 	for (i = 0; i < buffs; i++) {
 		dma = xsk_buff_xdp_get_dma(*xdp);
