@@ -1187,6 +1187,8 @@ int ice_clean_rx_irq(struct ice_rx_ring *rx_ring, int budget)
 				ice_vc_fdir_irq_handler(ctrl_vsi, rx_desc);
 			if (++ntc == cnt)
 				ntc = 0;
+			// what happens if we are in the middle of gathering
+			// the multi-buffer frame?
 			rx_ring->first_desc = ntc;
 			continue;
 		}
@@ -1205,6 +1207,9 @@ int ice_clean_rx_irq(struct ice_rx_ring *rx_ring, int budget)
 			xdp_prepare_buff(xdp, hard_start, offset, size, !!offset);
 			xdp_buff_clear_frags_flag(xdp);
 		} else if (ice_add_xdp_frag(rx_ring, xdp, rx_buf, size)) {
+			xdp->data = NULL;
+			rx_ring->first_desc = ntc;
+			rx_ring->nr_frags = 0;
 			break;
 		}
 		if (++ntc == cnt)
@@ -1242,16 +1247,29 @@ construct_skb:
 			rx_ring->nr_frags = 0;
 			break;
 		}
-		xdp->data = NULL;
-		rx_ring->first_desc = ntc;
-		rx_ring->nr_frags = 0;
 
 		stat_err_bits = BIT(ICE_RX_FLEX_DESC_STATUS0_RXE_S);
 		if (unlikely(ice_test_staterr(rx_desc->wb.status_error0,
 					      stat_err_bits))) {
 			dev_kfree_skb_any(skb);
+			// freeing the skb is not enough here...
+			rx_buf->act = ICE_XDP_CONSUMED;
+			if (unlikely(xdp_buff_has_frags(xdp)))
+				ice_set_rx_bufs_act(xdp, rx_ring,
+						    ICE_XDP_CONSUMED);
+			// TODO: wrap these three lines to helper
+			xdp->data = NULL;
+			rx_ring->first_desc = ntc;
+			rx_ring->nr_frags = 0;
 			continue;
 		}
+
+		// reason for moving this is *after* ICE_RX_FLEX_DESC_STATUS0_RXE_S
+		// check is to allow ice_set_rx_bufs_act() do it its work above;
+		// it relies on ::first_desc and ::nr_frags from ice_rx_ring;
+		xdp->data = NULL;
+		rx_ring->first_desc = ntc;
+		rx_ring->nr_frags = 0;
 
 		vlan_tci = ice_get_vlan_tci(rx_desc);
 
