@@ -35,7 +35,6 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include "xsk.h"
-#include "bpf_util.h"
 
 #ifndef SOL_XDP
  #define SOL_XDP 283
@@ -778,4 +777,50 @@ void xsk_socket__delete(struct xsk_socket *xsk)
 	if (xsk->fd != umem->fd)
 		close(xsk->fd);
 	free(xsk);
+}
+
+int xsk_get_hw_ring_size(const char *ifname, struct ethtool_ringparam *ring)
+{
+	struct ifreq ifr = {};
+	int fd, err;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -errno;
+
+	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+	ring->cmd = ETHTOOL_GRINGPARAM;
+	ifr.ifr_data = (char *)ring;
+
+	if (ioctl(fd, SIOCETHTOOL, &ifr) < 0) {
+		err = -errno;
+		close(fd);
+		return err;
+	}
+
+	close(fd);
+	return 0;
+}
+
+int xsk_set_hw_ring_size(const char *ifname, struct ethtool_ringparam *ring)
+{
+	struct ifreq ifr = {};
+	int fd, err;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -errno;
+
+	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+	ring->cmd = ETHTOOL_SRINGPARAM;
+	ifr.ifr_data = (char *)ring;
+
+	if (ioctl(fd, SIOCETHTOOL, &ifr) < 0) {
+		err = -errno;
+		close(fd);
+		return err;
+	}
+
+	close(fd);
+	return 0;
 }

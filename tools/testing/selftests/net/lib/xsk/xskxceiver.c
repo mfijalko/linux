@@ -91,22 +91,18 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 
-#include "prog_tests/test_xsk.h"
+#include "test_xsk.h"
 #include "xsk_xdp_progs.skel.h"
 #include "xsk.h"
 #include "xskxceiver.h"
 #include <bpf/bpf.h>
 #include <linux/filter.h>
-#include "kselftest.h"
+#include "../../../kselftest.h"
 #include "xsk_xdp_common.h"
-
-#include <network_helpers.h>
 
 static bool opt_print_tests;
 static enum test_mode opt_mode = TEST_MODE_ALL;
 static u32 opt_run_test = RUN_ALL_TESTS;
-
-void test__fail(void) { /* for network_helpers.c */ }
 
 static void __exit_with_error(int error, const char *file, const char *func, int line)
 {
@@ -402,7 +398,7 @@ int main(int argc, char **argv)
 			modes++;
 	}
 
-	ret = get_hw_ring_size(ifobj_tx->ifname, &ifobj_tx->ring);
+	ret = xsk_get_hw_ring_size(ifobj_tx->ifname, &ifobj_tx->ring);
 	if (!ret) {
 		ifobj_tx->hw_ring_size_supp = true;
 		ifobj_tx->set_ring.default_tx = ifobj_tx->ring.tx_pending;

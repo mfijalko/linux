@@ -62,7 +62,8 @@ COMMON_CFLAGS = -g $(OPT_FLAGS) -rdynamic -std=gnu11				\
 	  $(GENFLAGS) $(SAN_CFLAGS) $(LIBELF_CFLAGS)			\
 	  -I$(CURDIR) -I$(INCLUDE_DIR) -I$(GENDIR) -I$(LIBDIR)		\
 	  -I$(TOOLSINCDIR) -I$(TOOLSARCHINCDIR) -I$(APIDIR) -I$(OUTPUT)	\
-	  -I$(CURDIR)/libarena/include
+	  -I$(CURDIR)/libarena/include					\
+	  -I$(CURDIR)/../net/lib/xsk
 LDFLAGS += $(SAN_LDFLAGS)
 LDLIBS += $(LIBELF_LIBS) -lz -lrt -lpthread
 
@@ -464,6 +465,7 @@ CLANG_SYS_INCLUDES = $(call get_sys_includes,$(CLANG),$(CLANG_TARGET_ARCH))
 BPF_CFLAGS = -g -Wall -Werror -D__TARGET_ARCH_$(SRCARCH) $(MENDIAN)	\
 	     -I$(INCLUDE_DIR) -I$(CURDIR) -I$(APIDIR)			\
 	     -I$(TOOLSINCDIR) -I$(CURDIR)/libarena/include		\
+	     -I$(CURDIR)/../net/lib/xsk				\
 	     -I$(abspath $(OUTPUT)/../usr/include)			\
 	     -std=gnu11		 					\
 	     -fno-strict-aliasing 					\
@@ -627,6 +629,8 @@ $(TRUNNER_BPF_OBJS): $(TRUNNER_OUTPUT)/%.bpf.o:				\
 					  $$($$<-CFLAGS)		\
 					  $$($$<-$2-CFLAGS),$(TRUNNER_BINARY))
 
+$(TRUNNER_OUTPUT)/xsk_xdp_progs.bpf.o: ../net/lib/xsk/xsk_xdp_common.h
+
 $(TRUNNER_BPF_SKELS): %.skel.h: %.bpf.o $(BPFTOOL) | $(TRUNNER_OUTPUT)
 	$(Q)$(if $(PERMISSIVE),if [ ! -f $$< ]; then			\
 		$$(RM) $$@ $$(@:.skel.h=.subskel.h);			\
@@ -769,6 +773,11 @@ $(TRUNNER_EXTRA_OBJS): $(TRUNNER_OUTPUT)/%.o:				\
 	$$(call msg,EXT-OBJ,$(TRUNNER_BINARY),$$@)
 	$(Q)$$(CC) $$(CFLAGS) -c $$< $$(LDLIBS) -o $$@
 
+$(TRUNNER_OUTPUT)/xsk.o: ../net/lib/xsk/xsk.h
+$(TRUNNER_OUTPUT)/test_xsk.o: ../net/lib/xsk/test_xsk.h \
+			    ../net/lib/xsk/xsk.h ../net/lib/xsk/xsk_xdp_common.h \
+			    $(TRUNNER_OUTPUT)/xsk_xdp_progs.skel.h
+
 $(TRUNNER_LIB_OBJS): $(TRUNNER_OUTPUT)/%.o:$(TOOLSDIR)/lib/%.c
 	$$(call msg,LIB-OBJ,$(TRUNNER_BINARY),$$@)
 	$(Q)$$(CC) $$(CFLAGS) -c $$< $$(LDLIBS) -o $$@
@@ -845,6 +854,10 @@ $(LIBARENA_ASAN_SKEL): $(INCLUDE_DIR)/vmlinux.h $(BPFOBJ) $(LIBARENA_BPF_DEPS)
 	+$(MAKE) -C libarena libarena_asan.skel.h $(LIBARENA_MAKE_ARGS)
 endif
 
+# xsk.c and test_xsk.c live in ../net/lib/xsk so they can be shared with
+# drivers/net/hw; let make find them there instead of keeping local copies.
+vpath %.c ../net/lib/xsk
+
 # Define test_progs test runner.
 TRUNNER_TESTS_DIR := prog_tests
 TRUNNER_BPF_PROGS_DIR := progs
@@ -862,6 +875,7 @@ TRUNNER_EXTRA_SOURCES := test_progs.c		\
 			 io_helpers.c		\
 			 test_loader.c		\
 			 xsk.c			\
+			 test_xsk.c		\
 			 disasm.c		\
 			 disasm_helpers.c	\
 			 json_writer.c 		\
@@ -932,17 +946,19 @@ $(OUTPUT)/test_verifier: test_verifier.c verifier/tests.h $(BPFOBJ) | $(OUTPUT)
 	$(Q)$(CC) $(CFLAGS) $(filter %.a %.o %.c,$^) $(LDLIBS) -o $@
 
 # Keep xskxceiver independent from test_progs object dependencies.
-$(OUTPUT)/xskxceiver: xskxceiver.c xsk.c network_helpers.c \
-			   $(TOOLSDIR)/lib/find_bit.c prog_tests/test_xsk.c \
-			   xskxceiver.h xsk.h network_helpers.h \
-			   prog_tests/test_xsk.h test_progs.h bpf_util.h \
+# xskxceiver.c, xsk.c, test_xsk.c and their headers live in ../net/lib/xsk
+# so they can be shared with drivers/net/hw.
+$(OUTPUT)/xskxceiver: ../net/lib/xsk/xskxceiver.c ../net/lib/xsk/xsk.c \
+			   $(TOOLSDIR)/lib/find_bit.c ../net/lib/xsk/test_xsk.c \
+			   ../net/lib/xsk/xskxceiver.h ../net/lib/xsk/xsk.h \
+			   ../net/lib/xsk/test_xsk.h ../net/lib/xsk/xsk_xdp_common.h \
 			   $(OUTPUT)/xsk_xdp_progs.skel.h $(BPFOBJ) | $(OUTPUT)
 	$(call msg,BINARY,,$@)
 	$(Q)$(CC) $(CFLAGS) $(filter %.a %.o %.c,$^) $(LDLIBS) -o $@
 
-$(OUTPUT)/xdp_hw_metadata: xdp_hw_metadata.c xsk.c network_helpers.c \
+$(OUTPUT)/xdp_hw_metadata: xdp_hw_metadata.c ../net/lib/xsk/xsk.c network_helpers.c \
 			   $(TOOLSDIR)/lib/find_bit.c xdp_metadata.h \
-			   xsk.h network_helpers.h test_progs.h bpf_util.h \
+			   ../net/lib/xsk/xsk.h network_helpers.h test_progs.h bpf_util.h \
 			   $(OUTPUT)/xdp_hw_metadata.skel.h $(BPFOBJ) | $(OUTPUT)
 	$(call msg,BINARY,,$@)
 	$(Q)$(CC) $(CFLAGS) $(filter %.a %.o %.c,$^) $(LDLIBS) -o $@
