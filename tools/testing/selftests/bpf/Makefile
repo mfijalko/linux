@@ -947,6 +947,14 @@ $(OUTPUT)/test_verifier: test_verifier.c verifier/tests.h $(BPFOBJ) | $(OUTPUT)
 	$(call msg,BINARY,,$@)
 	$(Q)$(CC) $(CFLAGS) $(filter %.a %.o %.c,$^) $(LDLIBS) -o $@
 
+# XSK_STATIC=1 links xskxceiver statically so drivers/net/hw/xsk.py can
+# deploy the binary to a remote host with a different libc.
+ifeq ($(XSK_STATIC),1)
+$(OUTPUT)/xskxceiver: LDLIBS := -static \
+	$(shell $(PKG_CONFIG) libelf --static --libs 2>/dev/null || echo -lelf -lz -lzstd) \
+	-lz -lrt
+endif
+
 # Keep xskxceiver independent from test_progs object dependencies.
 # xskxceiver.c, xsk.c, test_xsk.c and their headers live in ../net/lib/xsk
 # so they can be shared with drivers/net/hw.
