@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <arpa/inet.h>
 #include <bpf/bpf.h>
 #include <errno.h>
 #include <linux/bitmap.h>
@@ -13,7 +14,6 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "network_helpers.h"
 #include "test_xsk.h"
 #include "xsk_xdp_common.h"
 #include "xsk_xdp_progs.skel.h"
@@ -175,7 +175,7 @@ static int set_ring_size(struct ifobject *ifobj)
 	u32 ctr = 0;
 
 	while (ctr++ < SOCK_RECONF_CTR) {
-		ret = set_hw_ring_size(ifobj->ifname, &ifobj->ring);
+		ret = xsk_set_hw_ring_size(ifobj->ifname, &ifobj->ring);
 		if (!ret)
 			break;
 
