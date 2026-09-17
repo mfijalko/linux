@@ -80,6 +80,9 @@ typedef int (*validation_func_t)(struct ifobject *ifobj);
 typedef void *(*thread_func_t)(void *arg);
 typedef int (*test_func_t)(struct test_spec *test);
 
+/* Packets TX has sent that RX has not yet reported consumed. */
+extern int pkts_in_flight;
+
 struct xsk_socket_info {
 	struct xsk_ring_cons rx;
 	struct xsk_ring_prod tx;

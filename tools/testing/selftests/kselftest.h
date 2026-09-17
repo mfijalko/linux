@@ -58,6 +58,70 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/utsname.h>
+
+static inline ssize_t ksft_read_nointr(int fd, void *buf, size_t count)
+{
+	ssize_t ret;
+
+	do {
+		ret = read(fd, buf, count);
+	} while (ret < 0 && errno == EINTR);
+
+	return ret;
+}
+
+static inline ssize_t ksft_write_nointr(int fd, const void *buf, size_t count)
+{
+	ssize_t ret;
+
+	do {
+		ret = write(fd, buf, count);
+	} while (ret < 0 && errno == EINTR);
+
+	return ret;
+}
+
+static inline ssize_t ksft_read_full(int fd, void *buf, size_t count)
+{
+	char *p = buf;
+	ssize_t total = 0;
+
+	while (count) {
+		ssize_t ret = ksft_read_nointr(fd, p, count);
+
+		if (ret < 0)
+			return ret;
+		if (!ret)
+			break;
+
+		p += ret;
+		count -= ret;
+		total += ret;
+	}
+
+	return total;
+}
+
+static inline ssize_t ksft_write_full(int fd, const void *buf, size_t count)
+{
+	const char *p = buf;
+	ssize_t total = 0;
+
+	while (count) {
+		ssize_t ret = ksft_write_nointr(fd, p, count);
+
+		if (ret < 0)
+			return ret;
+		if (!ret)
+			break;
+
+		p += ret;
+		count -= ret;
+		total += ret;
+	}
+
+	return total;
+}
 #endif
 
 #ifndef ARRAY_SIZE

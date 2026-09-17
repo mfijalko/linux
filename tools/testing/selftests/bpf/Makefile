@@ -777,6 +777,7 @@ $(TRUNNER_OUTPUT)/xsk.o: ../net/lib/xsk/xsk.h
 $(TRUNNER_OUTPUT)/test_xsk.o: ../net/lib/xsk/test_xsk.h \
 			    ../net/lib/xsk/xsk.h ../net/lib/xsk/xsk_xdp_common.h \
 			    $(TRUNNER_OUTPUT)/xsk_xdp_progs.skel.h
+$(TRUNNER_OUTPUT)/xsk_peer.o: ../net/lib/xsk/xsk_peer.h ../net/lib/xsk/test_xsk.h
 
 $(TRUNNER_LIB_OBJS): $(TRUNNER_OUTPUT)/%.o:$(TOOLSDIR)/lib/%.c
 	$$(call msg,LIB-OBJ,$(TRUNNER_BINARY),$$@)
@@ -876,6 +877,7 @@ TRUNNER_EXTRA_SOURCES := test_progs.c		\
 			 test_loader.c		\
 			 xsk.c			\
 			 test_xsk.c		\
+			 xsk_peer.c		\
 			 disasm.c		\
 			 disasm_helpers.c	\
 			 json_writer.c 		\
@@ -950,7 +952,9 @@ $(OUTPUT)/test_verifier: test_verifier.c verifier/tests.h $(BPFOBJ) | $(OUTPUT)
 # so they can be shared with drivers/net/hw.
 $(OUTPUT)/xskxceiver: ../net/lib/xsk/xskxceiver.c ../net/lib/xsk/xsk.c \
 			   $(TOOLSDIR)/lib/find_bit.c ../net/lib/xsk/test_xsk.c \
+			   ../net/lib/xsk/xsk_peer.c \
 			   ../net/lib/xsk/xskxceiver.h ../net/lib/xsk/xsk.h \
+			   ../net/lib/xsk/xsk_peer.h \
 			   ../net/lib/xsk/test_xsk.h ../net/lib/xsk/xsk_xdp_common.h \
 			   $(OUTPUT)/xsk_xdp_progs.skel.h $(BPFOBJ) | $(OUTPUT)
 	$(call msg,BINARY,,$@)
