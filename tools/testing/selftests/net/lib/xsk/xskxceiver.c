@@ -370,6 +370,13 @@ static bool is_xdp_supported(int ifindex)
 /* Probe the mode-gating capabilities: DRV, ZC and HW ring resizing. */
 static u32 detect_ifobj_caps(struct ifobject *ifobj)
 {
+	char driver[32];
+
+	/* veth delivers any destination MAC; a NIC only its own. */
+	if (xsk_get_driver(ifobj->ifname, driver, sizeof(driver)) ||
+	    strcmp(driver, "veth"))
+		ifobj->caps.flags |= XSK_CAP_MAC_FILTER;
+
 	if (is_xdp_supported(ifobj->ifindex)) {
 		ifobj->caps.flags |= XSK_CAP_DRV;
 		if (ifobj_zc_avail(ifobj))

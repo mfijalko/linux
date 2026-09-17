@@ -224,6 +224,7 @@ static void __test_spec_init(struct test_spec *test, struct ifobject *ifobj_tx,
 
 	for (i = 0; i < MAX_INTERFACES; i++) {
 		struct ifobject *ifobj = i ? ifobj_rx : ifobj_tx;
+		struct ifobject *peer = i ? ifobj_tx : ifobj_rx;
 		struct xsk_umem_info *umem_real;
 
 		ifobj->xsk = &ifobj->xsk_arr[0];
@@ -257,10 +258,16 @@ static void __test_spec_init(struct test_spec *test, struct ifobject *ifobj_tx,
 			else
 				xsk->pkt_stream = test->rx_pkt_stream_default;
 
-			memcpy(xsk->src_mac, g_mac, ETH_ALEN);
-			memcpy(xsk->dst_mac, g_mac, ETH_ALEN);
-			xsk->src_mac[5] += ((j * 2) + 0);
-			xsk->dst_mac[5] += ((j * 2) + 1);
+			if (ifobj_has_cap(ifobj, XSK_CAP_MAC_FILTER) ||
+			    ifobj_has_cap(peer, XSK_CAP_MAC_FILTER)) {
+				memcpy(xsk->src_mac, ifobj->caps.mac, ETH_ALEN);
+				memcpy(xsk->dst_mac, peer->caps.mac, ETH_ALEN);
+			} else {
+				memcpy(xsk->src_mac, g_mac, ETH_ALEN);
+				memcpy(xsk->dst_mac, g_mac, ETH_ALEN);
+				xsk->src_mac[5] += ((j * 2) + 0);
+				xsk->dst_mac[5] += ((j * 2) + 1);
+			}
 		}
 
 		ifobj->xsk->umem->num_frames = DEFAULT_UMEM_BUFFERS;
@@ -2183,9 +2190,17 @@ int testapp_xdp_metadata_copy(struct test_spec *test)
 
 int testapp_xdp_shared_umem(struct test_spec *test)
 {
-	struct xsk_xdp_progs *skel_rx = test->ifobj_rx->xdp_progs;
-	struct xsk_xdp_progs *skel_tx = test->ifobj_tx->xdp_progs;
+	struct xsk_xdp_progs *skel_rx;
+	struct xsk_xdp_progs *skel_tx;
 	int ret;
+
+	/* The XDP program picks the socket from the synthetic destination MAC. */
+	if (ifobj_has_cap(test->ifobj_rx, XSK_CAP_MAC_FILTER) ||
+	    ifobj_has_cap(test->ifobj_tx, XSK_CAP_MAC_FILTER))
+		return TEST_SKIP;
+
+	skel_rx = test->ifobj_rx->xdp_progs;
+	skel_tx = test->ifobj_tx->xdp_progs;
 
 	test->total_steps = 1;
 	test->nb_sockets = 2;

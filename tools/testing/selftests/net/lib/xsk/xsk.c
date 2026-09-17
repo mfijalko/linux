@@ -802,6 +802,31 @@ int xsk_get_hw_ring_size(const char *ifname, struct ethtool_ringparam *ring)
 	return 0;
 }
 
+int xsk_get_driver(const char *ifname, char *driver, size_t len)
+{
+	struct ethtool_drvinfo info = { .cmd = ETHTOOL_GDRVINFO };
+	struct ifreq ifr = {};
+	int fd, err;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -errno;
+
+	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+	ifr.ifr_data = (char *)&info;
+
+	if (ioctl(fd, SIOCETHTOOL, &ifr) < 0) {
+		err = -errno;
+		close(fd);
+		return err;
+	}
+
+	close(fd);
+	strncpy(driver, info.driver, len - 1);
+	driver[len - 1] = '\0';
+	return 0;
+}
+
 int xsk_get_mac(const char *ifname, u8 mac[ETH_ALEN])
 {
 	struct ifreq ifr = {};

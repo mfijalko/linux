@@ -140,6 +140,8 @@ int hw_ring_size_reset(struct ifobject *ifobj);
 #define XSK_CAP_MULTI_BUFF       (1U << 3)
 #define XSK_CAP_MULTI_BUFF_ZC    (1U << 4)
 #define XSK_CAP_HW_RING          (1U << 5)
+/* Frames must carry the real interface MACs to reach the peer. */
+#define XSK_CAP_MAC_FILTER       (1U << 6)
 
 /* Sized in u32 words so the peer control channel can carry it verbatim. */
 struct xsk_caps {
