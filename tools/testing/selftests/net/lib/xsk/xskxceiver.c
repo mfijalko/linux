@@ -100,7 +100,6 @@
 #include "../../../kselftest.h"
 #include "xsk_xdp_common.h"
 
-static bool opt_print_tests;
 static enum test_mode opt_mode = TEST_MODE_ALL;
 static u32 opt_run_test = RUN_ALL_TESTS;
 
@@ -184,17 +183,42 @@ static void print_usage(char **argv)
 	ksft_exit_xfail();
 }
 
-static bool validate_interface(struct ifobject *ifobj)
+static void bind_iface(struct ifobject *ifobj, const char *ifname, thread_func_t func,
+		       char **argv)
 {
-	if (!strcmp(ifobj->ifname, ""))
-		return false;
-	return true;
+	size_t len = ifname ? strlen(ifname) : 0;
+
+	if (!len || len >= sizeof(ifobj->ifname))
+		print_usage(argv);
+
+	memcpy(ifobj->ifname, ifname, len + 1);
+	ifobj->ifindex = if_nametoindex(ifobj->ifname);
+	if (!ifobj->ifindex) {
+		ksft_print_msg("Error: cannot resolve interface %s\n", ifobj->ifname);
+		ksft_exit_fail();
+	}
+
+	if (init_iface(ifobj, func)) {
+		ksft_print_msg("Error: cannot initialize interface %s\n", ifobj->ifname);
+		ksft_exit_fail();
+	}
+}
+
+static void print_tests(void)
+{
+	u32 i;
+
+	printf("Tests:\n");
+	for (i = 0; i < ARRAY_SIZE(tests); i++)
+		printf("%u: %s\n", i, tests[i].name);
+	for (i = ARRAY_SIZE(tests); i < ARRAY_SIZE(tests) + ARRAY_SIZE(ci_skip_tests); i++)
+		printf("%u: %s\n", i, ci_skip_tests[i - ARRAY_SIZE(tests)].name);
 }
 
 static void parse_command_line(struct ifobject *ifobj_tx, struct ifobject *ifobj_rx, int argc,
 			       char **argv)
 {
-	struct ifobject *ifobj;
+	const char *ifname[2] = {};
 	u32 interface_nb = 0;
 	int option_index, c;
 
@@ -207,21 +231,10 @@ static void parse_command_line(struct ifobject *ifobj_tx, struct ifobject *ifobj
 
 		switch (c) {
 		case 'i':
-			if (interface_nb == 0)
-				ifobj = ifobj_tx;
-			else if (interface_nb == 1)
-				ifobj = ifobj_rx;
-			else
+			if (interface_nb >= ARRAY_SIZE(ifname))
 				break;
 
-			memcpy(ifobj->ifname, optarg,
-			       min_t(size_t, MAX_INTERFACE_NAME_CHARS, strlen(optarg)));
-
-			ifobj->ifindex = if_nametoindex(ifobj->ifname);
-			if (!ifobj->ifindex)
-				exit_with_error(errno);
-
-			interface_nb++;
+			ifname[interface_nb++] = optarg;
 			break;
 		case 'v':
 			opt_verbose = true;
@@ -241,7 +254,8 @@ static void parse_command_line(struct ifobject *ifobj_tx, struct ifobject *ifobj
 				print_usage(argv);
 			break;
 		case 'l':
-			opt_print_tests = true;
+			print_tests();
+			ksft_exit_xpass();
 			break;
 		case 't':
 			errno = 0;
@@ -254,6 +268,15 @@ static void parse_command_line(struct ifobject *ifobj_tx, struct ifobject *ifobj
 			print_usage(argv);
 		}
 	}
+
+	bind_iface(ifobj_tx, ifname[0], worker_testapp_validate_tx, argv);
+	bind_iface(ifobj_rx, ifname[1], worker_testapp_validate_rx, argv);
+
+	/* Two sockets on one queue would need one UMEM shared by both. */
+	if (ifobj_tx->ifindex == ifobj_rx->ifindex) {
+		ksft_print_msg("Error: the TX and RX interfaces must differ.\n");
+		ksft_exit_xfail();
+	}
 }
 
 static void xsk_unload_xdp_programs(struct ifobject *ifobj)
@@ -261,12 +284,8 @@ static void xsk_unload_xdp_programs(struct ifobject *ifobj)
 	xsk_xdp_progs__destroy(ifobj->xdp_progs);
 }
 
-static void run_pkt_test(struct test_spec *test)
+static void report_pkt_test(struct test_spec *test, int ret)
 {
-	int ret;
-
-	ret = test->test_func(test);
-
 	switch (ret) {
 	case TEST_PASS:
 		ksft_test_result_pass("PASS: %s %s%s\n", mode_string(test), busy_poll_string(test),
@@ -284,8 +303,16 @@ static void run_pkt_test(struct test_spec *test)
 		ksft_test_result_fail("FAIL: %s %s%s -- Unexpected returned value (%d)\n",
 				      mode_string(test), busy_poll_string(test), test->name, ret);
 	}
+}
 
+static int run_pkt_test(struct test_spec *test)
+{
+	int ret;
+
+	ret = test->test_func(test);
+	report_pkt_test(test, ret);
 	pkt_stream_restore_default(test);
+	return ret;
 }
 
 static bool is_xdp_supported(int ifindex)
@@ -316,28 +343,107 @@ static bool is_xdp_supported(int ifindex)
 	return true;
 }
 
-static void print_tests(void)
+/* Probe the mode-gating capabilities: DRV, ZC and HW ring resizing. */
+static u32 detect_ifobj_caps(struct ifobject *ifobj)
 {
-	u32 i;
+	if (is_xdp_supported(ifobj->ifindex)) {
+		ifobj->caps.flags |= XSK_CAP_DRV;
+		if (ifobj_zc_avail(ifobj))
+			ifobj->caps.flags |= XSK_CAP_ZC;
+	}
 
-	printf("Tests:\n");
-	for (i = 0; i < ARRAY_SIZE(tests); i++)
-		printf("%u: %s\n", i, tests[i].name);
-	for (i = ARRAY_SIZE(tests); i < ARRAY_SIZE(tests) + ARRAY_SIZE(ci_skip_tests); i++)
-		printf("%u: %s\n", i, ci_skip_tests[i - ARRAY_SIZE(tests)].name);
+	if (!xsk_get_hw_ring_size(ifobj->ifname, &ifobj->ring)) {
+		ifobj->caps.flags |= XSK_CAP_HW_RING;
+		ifobj->caps.tx_max_pending = ifobj->ring.tx_max_pending;
+		ifobj->set_ring.default_tx = ifobj->ring.tx_pending;
+		ifobj->set_ring.default_rx = ifobj->ring.rx_pending;
+	}
+
+	return ifobj->caps.flags;
+}
+
+static const struct test_spec *test_by_id(u32 id)
+{
+	if (id < ARRAY_SIZE(tests))
+		return &tests[id];
+	return &ci_skip_tests[id - ARRAY_SIZE(tests)];
+}
+
+static bool mode_supported(enum test_mode mode, u32 caps)
+{
+	if (mode == TEST_MODE_SKB)
+		return true;
+	if (mode == TEST_MODE_DRV)
+		return caps & XSK_CAP_DRV;
+	return caps & XSK_CAP_ZC;
+}
+
+static u32 count_supported_modes(u32 caps)
+{
+	u32 i, modes = 0;
+
+	for (i = TEST_MODE_SKB; i <= TEST_MODE_ZC; i++)
+		if ((opt_mode == TEST_MODE_ALL || opt_mode == i) && mode_supported(i, caps))
+			modes++;
+
+	return modes;
+}
+
+static void cleanup_iface(struct ifobject *ifobj)
+{
+	if (ifobj_has_cap(ifobj, XSK_CAP_HW_RING))
+		hw_ring_size_reset(ifobj);
+	if (ifobj->xdp_prog)
+		xsk_detach_xdp_program(ifobj->ifindex,
+				       ifobj->mode == TEST_MODE_SKB ?
+				       XDP_FLAGS_SKB_MODE : XDP_FLAGS_DRV_MODE);
+	/* Skip the libbpf error pointer left by a failed open_and_load(). */
+	if (ifobj->xdp_progs && !libbpf_get_error(ifobj->xdp_progs))
+		xsk_unload_xdp_programs(ifobj);
+}
+
+static int run_test_suite(struct test_spec *test, struct ifobject *ifobj_tx,
+			  struct ifobject *ifobj_rx, u32 caps)
+{
+	const size_t total_tests = ARRAY_SIZE(tests) + ARRAY_SIZE(ci_skip_tests);
+	u32 i, j, nb_tests, modes, failed_tests = 0;
+	int ret;
+
+	nb_tests = opt_run_test == RUN_ALL_TESTS ? total_tests : 1;
+	modes = count_supported_modes(caps);
+	/* Line-buffer stdout so verdicts reach a capturing launcher live. */
+	ksft_print_header();
+	ksft_set_plan(modes * nb_tests);
+
+	for (i = TEST_MODE_SKB; i <= TEST_MODE_ZC; i++) {
+		if (opt_mode != TEST_MODE_ALL && opt_mode != i)
+			continue;
+		if (!mode_supported(i, caps))
+			continue;
+		for (j = 0; j < total_tests; j++) {
+			const struct test_spec *spec;
+
+			if (opt_run_test != RUN_ALL_TESTS && opt_run_test != j)
+				continue;
+			spec = test_by_id(j);
+			test_init(test, ifobj_tx, ifobj_rx, i, spec);
+			ret = run_pkt_test(test);
+			if (ret == TEST_FAILURE)
+				failed_tests++;
+			usleep(USLEEP_MAX);
+		}
+	}
+	return failed_tests ? TEST_FAILURE : TEST_PASS;
 }
 
 int main(int argc, char **argv)
 {
 	const size_t total_tests = ARRAY_SIZE(tests) + ARRAY_SIZE(ci_skip_tests);
 	u32 cache_line_size, max_frags, umem_tailroom;
-	struct pkt_stream *rx_pkt_stream_default;
-	struct pkt_stream *tx_pkt_stream_default;
 	struct ifobject *ifobj_tx, *ifobj_rx;
-	u32 i, j, failed_tests = 0, nb_tests;
-	int modes = TEST_MODE_SKB + 1;
-	struct test_spec test;
-	int ret;
+	struct test_spec test = {};
+	int ret = TEST_FAILURE;
+	u32 caps;
 
 	/* Use libbpf 1.0 API mode */
 	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
@@ -374,103 +480,37 @@ int main(int argc, char **argv)
 
 	parse_command_line(ifobj_tx, ifobj_rx, argc, argv);
 
-	if (opt_print_tests) {
-		print_tests();
-		ksft_exit_xpass();
-	}
 	if (opt_run_test != RUN_ALL_TESTS && opt_run_test >= total_tests) {
 		ksft_print_msg("Error: test %u does not exist.\n", opt_run_test);
 		ksft_exit_xfail();
 	}
 
-	if (!validate_interface(ifobj_tx) || !validate_interface(ifobj_rx))
-		print_usage(argv);
+	test.tx_pkt_stream_default = pkt_stream_generate(DEFAULT_PKT_CNT, MIN_PKT_SIZE);
+	test.rx_pkt_stream_default = pkt_stream_generate(DEFAULT_PKT_CNT, MIN_PKT_SIZE);
+	if (!test.tx_pkt_stream_default || !test.rx_pkt_stream_default)
+		goto out;
 
-	/* Two sockets on one queue would need one UMEM shared by both. */
-	if (ifobj_tx->ifindex == ifobj_rx->ifindex) {
-		ksft_print_msg("Error: the TX and RX interfaces must differ.\n");
-		ksft_exit_xfail();
-	}
+	caps = detect_ifobj_caps(ifobj_tx);
 
-	if (is_xdp_supported(ifobj_tx->ifindex)) {
-		modes++;
-		if (ifobj_zc_avail(ifobj_tx))
-			modes++;
-	}
-
-	ret = xsk_get_hw_ring_size(ifobj_tx->ifname, &ifobj_tx->ring);
-	if (!ret) {
-		ifobj_tx->caps.flags |= XSK_CAP_HW_RING;
-		ifobj_tx->caps.tx_max_pending = ifobj_tx->ring.tx_max_pending;
-		ifobj_tx->set_ring.default_tx = ifobj_tx->ring.tx_pending;
-		ifobj_tx->set_ring.default_rx = ifobj_tx->ring.rx_pending;
-	}
-
-	if (init_iface(ifobj_rx, worker_testapp_validate_rx) ||
-	    init_iface(ifobj_tx, worker_testapp_validate_tx)) {
-		ksft_print_msg("Error : can't initialize interfaces\n");
-		ksft_exit_xfail();
-	}
-
-	test_init(&test, ifobj_tx, ifobj_rx, 0, &tests[0]);
-	tx_pkt_stream_default = pkt_stream_generate(DEFAULT_PKT_CNT, MIN_PKT_SIZE);
-	rx_pkt_stream_default = pkt_stream_generate(DEFAULT_PKT_CNT, MIN_PKT_SIZE);
-	if (!tx_pkt_stream_default || !rx_pkt_stream_default)
-		exit_with_error(ENOMEM);
-	test.tx_pkt_stream_default = tx_pkt_stream_default;
-	test.rx_pkt_stream_default = rx_pkt_stream_default;
-
-	if (opt_run_test == RUN_ALL_TESTS)
-		nb_tests = total_tests;
-	else
-		nb_tests = 1;
-	if (opt_mode == TEST_MODE_ALL) {
-		ksft_set_plan(modes * nb_tests);
-	} else {
-		if (opt_mode == TEST_MODE_DRV && modes <= TEST_MODE_DRV) {
+	if (opt_mode != TEST_MODE_ALL && !count_supported_modes(caps)) {
+		if (opt_mode == TEST_MODE_DRV)
 			ksft_print_msg("Error: XDP_DRV mode not supported.\n");
-			ksft_exit_xfail();
-		}
-		if (opt_mode == TEST_MODE_ZC && modes <= TEST_MODE_ZC) {
+		else
 			ksft_print_msg("Error: zero-copy mode not supported.\n");
-			ksft_exit_xfail();
-		}
-
-		ksft_set_plan(nb_tests);
+		ksft_exit_xfail();
 	}
 
-	for (i = 0; i < modes; i++) {
-		if (opt_mode != TEST_MODE_ALL && i != opt_mode)
-			continue;
+	ret = run_test_suite(&test, ifobj_tx, ifobj_rx, caps);
 
-		for (j = 0; j < total_tests; j++) {
-			if (opt_run_test != RUN_ALL_TESTS && j != opt_run_test)
-				continue;
-
-			if (j < ARRAY_SIZE(tests))
-				test_init(&test, ifobj_tx, ifobj_rx, i, &tests[j]);
-			else
-				test_init(&test, ifobj_tx, ifobj_rx, i,
-					  &ci_skip_tests[j - ARRAY_SIZE(tests)]);
-			run_pkt_test(&test);
-			usleep(USLEEP_MAX);
-
-			if (test.fail)
-				failed_tests++;
-		}
-	}
-
-	if (ifobj_has_cap(ifobj_tx, XSK_CAP_HW_RING))
-		hw_ring_size_reset(ifobj_tx);
-
-	pkt_stream_delete(tx_pkt_stream_default);
-	pkt_stream_delete(rx_pkt_stream_default);
-	xsk_unload_xdp_programs(ifobj_tx);
-	xsk_unload_xdp_programs(ifobj_rx);
+out:
+	cleanup_iface(ifobj_tx);
+	cleanup_iface(ifobj_rx);
+	pkt_stream_delete(test.tx_pkt_stream_default);
+	pkt_stream_delete(test.rx_pkt_stream_default);
 	ifobject_delete(ifobj_tx);
 	ifobject_delete(ifobj_rx);
 
-	if (failed_tests)
+	if (ret)
 		ksft_exit_fail();
 	else
 		ksft_exit_pass();
