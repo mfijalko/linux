@@ -92,6 +92,7 @@
 #include <sys/types.h>
 
 #include "test_xsk.h"
+#include "xsk_peer.h"
 #include "xsk_xdp_progs.skel.h"
 #include "xsk.h"
 #include "xskxceiver.h"
@@ -102,6 +103,10 @@
 
 static enum test_mode opt_mode = TEST_MODE_ALL;
 static u32 opt_run_test = RUN_ALL_TESTS;
+static enum xsk_endpoint_role opt_endpoint_role = XSK_ENDPOINT_NONE;
+static const char *opt_peer_host;
+static const char *opt_peer_port;
+static const char *opt_ifname;
 
 static void __exit_with_error(int error, const char *file, const char *func, int line)
 {
@@ -162,6 +167,9 @@ static struct option long_options[] = {
 	{"mode", required_argument, 0, 'm'},
 	{"list", no_argument, 0, 'l'},
 	{"test", required_argument, 0, 't'},
+	{"endpoint", required_argument, 0, 'e'},
+	{"peer", required_argument, 0, 'p'},
+	{"peer-port", required_argument, 0, 'P'},
 	{"help", no_argument, 0, 'h'},
 	{0, 0, 0, 0}
 };
@@ -169,24 +177,27 @@ static struct option long_options[] = {
 static void print_usage(char **argv)
 {
 	const char *str =
-		"  Usage: xskxceiver [OPTIONS]\n"
+		"  Usage: xskxceiver -i IFACE -e rx|tx -p HOST -P PORT [OPTIONS]\n"
 		"  Options:\n"
-		"  -i, --interface      Use interface\n"
+		"  -i, --interface      Interface this endpoint drives\n"
 		"  -v, --verbose        Verbose output\n"
 		"  -b, --busy-poll      Enable busy poll\n"
 		"  -m, --mode           Run only mode skb, drv, or zc\n"
 		"  -l, --list           List all available tests\n"
 		"  -t, --test           Run a specific test. Enter number from -l option.\n"
+		"  -e, --endpoint       Role of this endpoint: rx or tx\n"
+		"  -p, --peer           Control host: IPv4/IPv6 address or hostname\n"
+		"  -P, --peer-port      Control TCP port (1-65535); the tx endpoint\n"
+		"                       listens on it, the rx endpoint connects to it\n"
 		"  -h, --help           Display this help and exit\n";
 
 	ksft_print_msg(str, basename(argv[0]));
 	ksft_exit_xfail();
 }
 
-static void bind_iface(struct ifobject *ifobj, const char *ifname, thread_func_t func,
-		       char **argv)
+static void bind_iface(struct ifobject *ifobj, const char *ifname, char **argv)
 {
-	size_t len = ifname ? strlen(ifname) : 0;
+	size_t len = strlen(ifname);
 
 	if (!len || len >= sizeof(ifobj->ifname))
 		print_usage(argv);
@@ -198,7 +209,7 @@ static void bind_iface(struct ifobject *ifobj, const char *ifname, thread_func_t
 		ksft_exit_fail();
 	}
 
-	if (init_iface(ifobj, func)) {
+	if (init_iface(ifobj)) {
 		ksft_print_msg("Error: cannot initialize interface %s\n", ifobj->ifname);
 		ksft_exit_fail();
 	}
@@ -218,23 +229,20 @@ static void print_tests(void)
 static void parse_command_line(struct ifobject *ifobj_tx, struct ifobject *ifobj_rx, int argc,
 			       char **argv)
 {
-	const char *ifname[2] = {};
-	u32 interface_nb = 0;
 	int option_index, c;
+	unsigned long val;
+	char *end;
 
 	opterr = 0;
 
 	for (;;) {
-		c = getopt_long(argc, argv, "i:vbm:lt:", long_options, &option_index);
+		c = getopt_long(argc, argv, "i:vbm:lt:e:p:P:", long_options, &option_index);
 		if (c == -1)
 			break;
 
 		switch (c) {
 		case 'i':
-			if (interface_nb >= ARRAY_SIZE(ifname))
-				break;
-
-			ifname[interface_nb++] = optarg;
+			opt_ifname = optarg;
 			break;
 		case 'v':
 			opt_verbose = true;
@@ -263,20 +271,34 @@ static void parse_command_line(struct ifobject *ifobj_tx, struct ifobject *ifobj
 			if (errno)
 				print_usage(argv);
 			break;
+		case 'e':
+			if (!strcmp(optarg, "rx"))
+				opt_endpoint_role = XSK_ENDPOINT_RX;
+			else if (!strcmp(optarg, "tx"))
+				opt_endpoint_role = XSK_ENDPOINT_TX;
+			else
+				print_usage(argv);
+			break;
+		case 'p':
+			opt_peer_host = optarg;
+			break;
+		case 'P':
+			errno = 0;
+			val = strtoul(optarg, &end, 10);
+			if (optarg[0] < '0' || optarg[0] > '9' || errno ||
+			    *end || !val || val > UINT16_MAX)
+				print_usage(argv);
+			opt_peer_port = optarg;
+			break;
 		case 'h':
 		default:
 			print_usage(argv);
 		}
 	}
 
-	bind_iface(ifobj_tx, ifname[0], worker_testapp_validate_tx, argv);
-	bind_iface(ifobj_rx, ifname[1], worker_testapp_validate_rx, argv);
-
-	/* Two sockets on one queue would need one UMEM shared by both. */
-	if (ifobj_tx->ifindex == ifobj_rx->ifindex) {
-		ksft_print_msg("Error: the TX and RX interfaces must differ.\n");
-		ksft_exit_xfail();
-	}
+	if (opt_endpoint_role == XSK_ENDPOINT_NONE || !opt_ifname ||
+	    !opt_peer_host || !*opt_peer_host || !opt_peer_port)
+		print_usage(argv);
 }
 
 static void xsk_unload_xdp_programs(struct ifobject *ifobj)
@@ -305,11 +327,13 @@ static void report_pkt_test(struct test_spec *test, int ret)
 	}
 }
 
-static int run_pkt_test(struct test_spec *test)
+static int run_pkt_test(struct test_spec *test, struct xsk_peer *peer, u32 sync_id)
 {
 	int ret;
 
+	xsk_peer_test_begin(peer, sync_id);
 	ret = test->test_func(test);
+	ret = xsk_peer_test_result(peer, ret);
 	report_pkt_test(test, ret);
 	pkt_stream_restore_default(test);
 	return ret;
@@ -391,22 +415,25 @@ static u32 count_supported_modes(u32 caps)
 
 static void cleanup_iface(struct ifobject *ifobj)
 {
-	if (ifobj_has_cap(ifobj, XSK_CAP_HW_RING))
-		hw_ring_size_reset(ifobj);
-	if (ifobj->xdp_prog)
-		xsk_detach_xdp_program(ifobj->ifindex,
-				       ifobj->mode == TEST_MODE_SKB ?
-				       XDP_FLAGS_SKB_MODE : XDP_FLAGS_DRV_MODE);
+	/* A peer shadow has a skeleton but no bound interface. */
+	if (ifobj->ifindex) {
+		if (ifobj_has_cap(ifobj, XSK_CAP_HW_RING))
+			hw_ring_size_reset(ifobj);
+		if (ifobj->xdp_prog)
+			xsk_detach_xdp_program(ifobj->ifindex,
+					       ifobj->mode == TEST_MODE_SKB ?
+					       XDP_FLAGS_SKB_MODE : XDP_FLAGS_DRV_MODE);
+	}
 	/* Skip the libbpf error pointer left by a failed open_and_load(). */
 	if (ifobj->xdp_progs && !libbpf_get_error(ifobj->xdp_progs))
 		xsk_unload_xdp_programs(ifobj);
 }
 
 static int run_test_suite(struct test_spec *test, struct ifobject *ifobj_tx,
-			  struct ifobject *ifobj_rx, u32 caps)
+			  struct ifobject *ifobj_rx, u32 caps, struct xsk_peer *peer)
 {
 	const size_t total_tests = ARRAY_SIZE(tests) + ARRAY_SIZE(ci_skip_tests);
-	u32 i, j, nb_tests, modes, failed_tests = 0;
+	u32 i, j, nb_tests, modes, failed_tests = 0, sync_id = 0;
 	int ret;
 
 	nb_tests = opt_run_test == RUN_ALL_TESTS ? total_tests : 1;
@@ -427,13 +454,43 @@ static int run_test_suite(struct test_spec *test, struct ifobject *ifobj_tx,
 				continue;
 			spec = test_by_id(j);
 			test_init(test, ifobj_tx, ifobj_rx, i, spec);
-			ret = run_pkt_test(test);
+			ret = run_pkt_test(test, peer, sync_id++);
 			if (ret == TEST_FAILURE)
 				failed_tests++;
+			if (xsk_peer_broken(peer))
+				return TEST_FAILURE;
 			usleep(USLEEP_MAX);
 		}
 	}
 	return failed_tests ? TEST_FAILURE : TEST_PASS;
+}
+
+/*
+ * Connect the control channel, exchange capabilities and narrow *caps down
+ * to the common set, then hand the owned interface and the peer to the
+ * engine.
+ */
+static int setup_peer(struct ifobject *owned, struct ifobject *shadow,
+		      u32 *caps, struct xsk_peer **peer)
+{
+	/* Unattached skeleton copy; the engine only attaches the owned side. */
+	if (xsk_load_xdp_programs(shadow))
+		return TEST_FAILURE;
+
+	/* TX listens on the control address; RX connects to it. */
+	*peer = xsk_peer_open(opt_peer_host, opt_peer_port,
+			      opt_endpoint_role == XSK_ENDPOINT_TX);
+	if (!*peer) {
+		ksft_print_msg("Failed to connect XSK peer: %s\n", strerror(errno));
+		return TEST_FAILURE;
+	}
+
+	if (xsk_peer_exchange_caps(*peer, owned, shadow))
+		return TEST_FAILURE;
+	*caps &= shadow->caps.flags;
+
+	xsk_set_endpoint(*peer, owned);
+	return TEST_PASS;
 }
 
 int main(int argc, char **argv)
@@ -441,6 +498,9 @@ int main(int argc, char **argv)
 	const size_t total_tests = ARRAY_SIZE(tests) + ARRAY_SIZE(ci_skip_tests);
 	u32 cache_line_size, max_frags, umem_tailroom;
 	struct ifobject *ifobj_tx, *ifobj_rx;
+	struct ifobject *endpoint_ifobj;
+	struct ifobject *shadow_ifobj;
+	struct xsk_peer *peer = NULL;
 	struct test_spec test = {};
 	int ret = TEST_FAILURE;
 	u32 caps;
@@ -485,12 +545,24 @@ int main(int argc, char **argv)
 		ksft_exit_xfail();
 	}
 
+	if (opt_endpoint_role == XSK_ENDPOINT_TX) {
+		endpoint_ifobj = ifobj_tx;
+		shadow_ifobj = ifobj_rx;
+	} else {
+		endpoint_ifobj = ifobj_rx;
+		shadow_ifobj = ifobj_tx;
+	}
+	bind_iface(endpoint_ifobj, opt_ifname, argv);
+
 	test.tx_pkt_stream_default = pkt_stream_generate(DEFAULT_PKT_CNT, MIN_PKT_SIZE);
 	test.rx_pkt_stream_default = pkt_stream_generate(DEFAULT_PKT_CNT, MIN_PKT_SIZE);
 	if (!test.tx_pkt_stream_default || !test.rx_pkt_stream_default)
 		goto out;
 
-	caps = detect_ifobj_caps(ifobj_tx);
+	caps = detect_ifobj_caps(endpoint_ifobj);
+
+	if (setup_peer(endpoint_ifobj, shadow_ifobj, &caps, &peer))
+		goto out;
 
 	if (opt_mode != TEST_MODE_ALL && !count_supported_modes(caps)) {
 		if (opt_mode == TEST_MODE_DRV)
@@ -500,11 +572,13 @@ int main(int argc, char **argv)
 		ksft_exit_xfail();
 	}
 
-	ret = run_test_suite(&test, ifobj_tx, ifobj_rx, caps);
+	ret = run_test_suite(&test, ifobj_tx, ifobj_rx, caps, peer);
 
 out:
+	xsk_set_endpoint(NULL, NULL);
 	cleanup_iface(ifobj_tx);
 	cleanup_iface(ifobj_rx);
+	xsk_peer_close(peer);
 	pkt_stream_delete(test.tx_pkt_stream_default);
 	pkt_stream_delete(test.rx_pkt_stream_default);
 	ifobject_delete(ifobj_tx);
@@ -512,6 +586,5 @@ out:
 
 	if (ret)
 		ksft_exit_fail();
-	else
-		ksft_exit_pass();
+	ksft_exit_pass();
 }

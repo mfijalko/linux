@@ -7,7 +7,6 @@
 #include <linux/mman.h>
 #include <linux/netdev.h>
 #include <poll.h>
-#include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -15,6 +14,7 @@
 #include <unistd.h>
 
 #include "test_xsk.h"
+#include "xsk_peer.h"
 #include "xsk_xdp_common.h"
 #include "xsk_xdp_progs.skel.h"
 
@@ -38,10 +38,31 @@
 static const u8 g_mac[ETH_ALEN] = {0x55, 0x44, 0x33, 0x22, 0x11, 0x00};
 
 bool opt_verbose;
-pthread_barrier_t barr;
-pthread_mutex_t pacing_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int pkts_in_flight;
+static struct xsk_peer *ctrl_peer;
+static struct ifobject *ep_ifobj;
+
+void xsk_set_endpoint(struct xsk_peer *peer, struct ifobject *owned)
+{
+	ctrl_peer = peer;
+	ep_ifobj = owned;
+}
+
+static bool endpoint_owns(struct ifobject *ifobj)
+{
+	return ifobj == ep_ifobj;
+}
+
+static int pacing_rx_progress(u32 pkts)
+{
+	return xsk_peer_rx_progress(ctrl_peer, pkts);
+}
+
+static int pacing_tx_sync(void)
+{
+	return xsk_peer_tx_sync(ctrl_peer);
+}
 
 /* The payload is a word consisting of a packet sequence number in the upper
  * 16-bits and a intra packet data sequence number in the lower 16 bits. So the 3rd packet's
@@ -246,7 +267,7 @@ static void __test_spec_init(struct test_spec *test, struct ifobject *ifobj_tx,
 		ifobj->xsk->umem->frame_size = XSK_UMEM__DEFAULT_FRAME_SIZE;
 	}
 
-	if (ifobj_has_cap(ifobj_tx, XSK_CAP_HW_RING))
+	if (ifobj_has_cap(ifobj_tx, XSK_CAP_HW_RING) && endpoint_owns(ifobj_tx))
 		hw_ring_size_reset(ifobj_tx);
 
 	test->ifobj_tx = ifobj_tx;
@@ -254,7 +275,6 @@ static void __test_spec_init(struct test_spec *test, struct ifobject *ifobj_tx,
 	test->current_step = 0;
 	test->total_steps = 1;
 	test->nb_sockets = 1;
-	test->fail = false;
 	test->set_ring = false;
 	test->adjust_tail = false;
 	test->adjust_tail_support = false;
@@ -322,24 +342,32 @@ static void test_spec_set_xdp_prog(struct test_spec *test, struct bpf_program *x
 	test->xskmap_tx = xskmap_tx;
 }
 
+static int test_spec_set_mtu_ifobj(struct ifobject *ifobj, int mtu)
+{
+	int err;
+
+	if (ifobj->mtu == mtu)
+		return 0;
+
+	if (endpoint_owns(ifobj)) {
+		err = xsk_set_mtu(ifobj->ifindex, mtu);
+		if (err)
+			return err;
+	}
+
+	ifobj->mtu = mtu;
+	return 0;
+}
+
 static int test_spec_set_mtu(struct test_spec *test, int mtu)
 {
 	int err;
 
-	if (test->ifobj_rx->mtu != mtu) {
-		err = xsk_set_mtu(test->ifobj_rx->ifindex, mtu);
-		if (err)
-			return err;
-		test->ifobj_rx->mtu = mtu;
-	}
-	if (test->ifobj_tx->mtu != mtu) {
-		err = xsk_set_mtu(test->ifobj_tx->ifindex, mtu);
-		if (err)
-			return err;
-		test->ifobj_tx->mtu = mtu;
-	}
+	err = test_spec_set_mtu_ifobj(test->ifobj_rx, mtu);
+	if (err)
+		return err;
 
-	return 0;
+	return test_spec_set_mtu_ifobj(test->ifobj_tx, mtu);
 }
 
 void pkt_stream_reset(struct pkt_stream *pkt_stream)
@@ -993,6 +1021,9 @@ static int __receive_pkts(struct test_spec *test, struct xsk_socket_info *xsk)
 	fds.fd = xsk_socket__fd(xsk->xsk);
 	fds.events = POLLIN;
 
+	if (pacing_rx_progress(0))
+		return TEST_FAILURE;
+
 	ret = kick_rx(xsk);
 	if (ret)
 		return TEST_FAILURE;
@@ -1092,9 +1123,8 @@ static int __receive_pkts(struct test_spec *test, struct xsk_socket_info *xsk)
 	if (ifobj->release_rx)
 		xsk_ring_cons__release(&xsk->rx, frags_processed);
 
-	pthread_mutex_lock(&pacing_mutex);
-	pkts_in_flight -= pkts_sent;
-	pthread_mutex_unlock(&pacing_mutex);
+	if (pacing_rx_progress(pkts_sent))
+		return TEST_FAILURE;
 	pkts_sent = 0;
 
 	return TEST_CONTINUE;
@@ -1170,6 +1200,9 @@ static int __send_pkts(struct ifobject *ifobject, struct xsk_socket_info *xsk,
 	int ret;
 
 	buffer_len = pkt_get_buffer_len(umem, pkt_stream->max_pkt_len);
+	if (pacing_tx_sync())
+		return TEST_FAILURE;
+
 	/* pkts_in_flight might be negative if many invalid packets are sent */
 	if (pkts_in_flight >= (int)((umem_size(umem) - xsk->batch_size * buffer_len) /
 	    buffer_len) && !test_timeout) {
@@ -1254,9 +1287,7 @@ static int __send_pkts(struct ifobject *ifobject, struct xsk_socket_info *xsk,
 		valid_frags += nb_frags;
 	}
 
-	pthread_mutex_lock(&pacing_mutex);
 	pkts_in_flight += valid_pkts;
-	pthread_mutex_unlock(&pacing_mutex);
 
 	xsk_ring_prod__submit(&xsk->tx, i);
 	xsk->outstanding_tx += valid_frags;
@@ -1332,9 +1363,6 @@ static int send_pkts(struct test_spec *test, struct ifobject *ifobject)
 			ret = __send_pkts(ifobject, &ifobject->xsk_arr[i], test->poll_tmout);
 			if (ret != TEST_CONTINUE)
 				return ret;
-
-			if (test->fail)
-				return TEST_FAILURE;
 
 			if (!test->poll_tmout) {
 				ret = wait_for_tx_completion(&ifobject->xsk_arr[i]);
@@ -1655,36 +1683,30 @@ static int testapp_validate_rx_endpoint(struct test_spec *test,
 	return err;
 }
 
-void *worker_testapp_validate_tx(void *arg)
+/* One step of a test as seen by this process; NULL means it only syncs. */
+static int testapp_run_endpoint(struct test_spec *test, struct ifobject *ifobj)
 {
-	struct test_spec *test = arg;
-	int err;
+	enum xsk_endpoint_role role = XSK_ENDPOINT_NONE;
+	u32 step = test->current_step;
+	int err = 0, sync_err;
 
-	err = testapp_validate_tx_endpoint(test, test->ifobj_tx);
-	if (err)
-		test->fail = true;
+	if (ifobj)
+		role = ifobj == test->ifobj_rx ? XSK_ENDPOINT_RX : XSK_ENDPOINT_TX;
+	if (role == XSK_ENDPOINT_RX)
+		err = testapp_prepare_rx_endpoint(test, ifobj);
 
-	return NULL;
-}
+	/* Announce preparation failures too, so the other endpoint can stop. */
+	sync_err = xsk_peer_step_start(ctrl_peer, step, err ? TEST_FAILURE : TEST_PASS);
+	if (err || sync_err)
+		return err ? err : sync_err;
 
-void *worker_testapp_validate_rx(void *arg)
-{
-	struct test_spec *test = arg;
-	struct ifobject *ifobject = test->ifobj_rx;
-	int err;
+	if (role == XSK_ENDPOINT_RX)
+		err = testapp_validate_rx_endpoint(test, ifobj);
+	else if (role == XSK_ENDPOINT_TX)
+		err = testapp_validate_tx_endpoint(test, ifobj);
 
-	err = testapp_prepare_rx_endpoint(test, ifobject);
-
-	if (test->use_barrier)
-		pthread_barrier_wait(&barr);
-
-	/* Leave only after the barrier so the peer cannot get stuck. */
-	if (!err)
-		err = testapp_validate_rx_endpoint(test, ifobject);
-	if (err)
-		test->fail = true;
-
-	return NULL;
+	sync_err = xsk_peer_step_done(ctrl_peer, step, err ? TEST_FAILURE : TEST_PASS);
+	return err ? err : sync_err;
 }
 
 static void testapp_clean_xsk_umem(struct ifobject *ifobj)
@@ -1739,13 +1761,13 @@ static int xsk_attach_xdp_progs(struct test_spec *test, struct ifobject *ifobj_r
 {
 	int err = 0;
 
-	if (xdp_prog_changed_rx(test)) {
+	if (endpoint_owns(ifobj_rx) && xdp_prog_changed_rx(test)) {
 		err = xsk_reattach_xdp(ifobj_rx, test->xdp_prog_rx, test->xskmap_rx, test->mode);
 		if (err)
 			return err;
 	}
 
-	if (!ifobj_tx)
+	if (!ifobj_tx || !endpoint_owns(ifobj_tx))
 		return 0;
 
 	if (xdp_prog_changed_tx(test))
@@ -1758,7 +1780,7 @@ static void clean_sockets(struct test_spec *test, struct ifobject *ifobj)
 {
 	u32 i;
 
-	if (!ifobj || !test)
+	if (!ifobj || !test || !endpoint_owns(ifobj))
 		return;
 
 	for (i = 0; i < test->nb_sockets; i++)
@@ -1770,15 +1792,16 @@ static void clean_umem(struct test_spec *test, struct ifobject *ifobj1, struct i
 	if (!ifobj1)
 		return;
 
-	testapp_clean_xsk_umem(ifobj1);
-	if (ifobj2)
+	if (endpoint_owns(ifobj1))
+		testapp_clean_xsk_umem(ifobj1);
+	if (ifobj2 && endpoint_owns(ifobj2))
 		testapp_clean_xsk_umem(ifobj2);
 }
 
 static int __testapp_validate_traffic(struct test_spec *test, struct ifobject *ifobj1,
 				      struct ifobject *ifobj2)
 {
-	pthread_t t0, t1;
+	struct ifobject *owned = NULL;
 	int err;
 
 	if (test->mtu > MAX_ETH_PKT_SIZE) {
@@ -1807,51 +1830,25 @@ static int __testapp_validate_traffic(struct test_spec *test, struct ifobject *i
 			       err, strerror(-err));
 		return TEST_FAILURE;
 	}
-	test->use_barrier = !!ifobj2;
 
-	if (test->use_barrier) {
-		if (pthread_barrier_init(&barr, NULL, 2))
-			return TEST_FAILURE;
-
+	if (ifobj2)
 		pkt_stream_reset(ifobj2->xsk->pkt_stream);
-	}
-
 	test->current_step++;
 	pkt_stream_reset(ifobj1->xsk->pkt_stream);
 	pkts_in_flight = 0;
 
-	/*Spawn RX thread */
-	pthread_create(&t0, NULL, ifobj1->func_ptr, test);
-
-	if (test->use_barrier) {
-		pthread_barrier_wait(&barr);
-		if (pthread_barrier_destroy(&barr)) {
-			test->use_barrier = false;
-			pthread_join(t0, NULL);
-			clean_sockets(test, ifobj1);
-			clean_umem(test, ifobj1, NULL);
-			return TEST_FAILURE;
-		}
-	}
-
-	if (ifobj2) {
-		/*Spawn TX thread */
-		pthread_create(&t1, NULL, ifobj2->func_ptr, test);
-		pthread_join(t1, NULL);
-	}
-
-	pthread_join(t0, NULL);
-
-	if (test->total_steps == test->current_step || test->fail) {
+	if (endpoint_owns(ifobj1))
+		owned = ifobj1;
+	else if (ifobj2 && endpoint_owns(ifobj2))
+		owned = ifobj2;
+	err = testapp_run_endpoint(test, owned);
+	if (test->total_steps == test->current_step || err) {
 		clean_sockets(test, ifobj1);
 		clean_sockets(test, ifobj2);
 		clean_umem(test, ifobj1, ifobj2);
 	}
 
-	if (test->fail)
-		return TEST_FAILURE;
-
-	return TEST_PASS;
+	return err ? TEST_FAILURE : TEST_PASS;
 }
 
 static int testapp_validate_traffic(struct test_spec *test)
@@ -1867,7 +1864,7 @@ static int testapp_validate_traffic(struct test_spec *test)
 
 	if (test->set_ring) {
 		if (ifobj_has_cap(ifobj_tx, XSK_CAP_HW_RING)) {
-			if (set_ring_size(ifobj_tx)) {
+			if (endpoint_owns(ifobj_tx) && set_ring_size(ifobj_tx)) {
 				ksft_print_msg("Failed to change HW ring size.\n");
 				return TEST_FAILURE;
 			}
@@ -1900,11 +1897,7 @@ int testapp_teardown(struct test_spec *test)
 
 static void swap_directions(struct ifobject **ifobj1, struct ifobject **ifobj2)
 {
-	thread_func_t tmp_func_ptr = (*ifobj1)->func_ptr;
 	struct ifobject *tmp_ifobj = (*ifobj1);
-
-	(*ifobj1)->func_ptr = (*ifobj2)->func_ptr;
-	(*ifobj2)->func_ptr = tmp_func_ptr;
 
 	*ifobj1 = *ifobj2;
 	*ifobj2 = tmp_ifobj;
@@ -1938,6 +1931,9 @@ static int swap_xsk_resources(struct test_spec *test)
 	test->ifobj_rx->xsk_arr[1].pkt_stream = test->rx_pkt_stream_default;
 	test->ifobj_tx->xsk = &test->ifobj_tx->xsk_arr[1];
 	test->ifobj_rx->xsk = &test->ifobj_rx->xsk_arr[1];
+
+	if (!endpoint_owns(test->ifobj_rx))
+		return TEST_PASS;
 
 	ret = xsk_update_xskmap(test->ifobj_rx->xskmap, test->ifobj_rx->xsk->xsk, 0);
 	if (ret)
@@ -2287,7 +2283,7 @@ int testapp_too_many_frags(struct test_spec *test)
 	return ret;
 }
 
-static int xsk_load_xdp_programs(struct ifobject *ifobj)
+int xsk_load_xdp_programs(struct ifobject *ifobj)
 {
 	ifobj->xdp_progs = xsk_xdp_progs__open_and_load();
 	if (libbpf_get_error(ifobj->xdp_progs))
@@ -2312,12 +2308,10 @@ static bool hugepages_present(void)
 	return true;
 }
 
-int init_iface(struct ifobject *ifobj, thread_func_t func_ptr)
+int init_iface(struct ifobject *ifobj)
 {
 	LIBBPF_OPTS(bpf_xdp_query_opts, query_opts);
 	int err;
-
-	ifobj->func_ptr = func_ptr;
 
 	err = xsk_load_xdp_programs(ifobj);
 	if (err) {

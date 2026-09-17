@@ -8,22 +8,20 @@
 #
 # Topology:
 # ---------
-#                 -----------
-#               _ | Process | _
-#              /  -----------  \
-#             /        |        \
-#            /         |         \
-#      -----------     |     -----------
-#      | Thread1 |     |     | Thread2 |
-#      -----------     |     -----------
-#           |          |          |
-#      -----------     |     -----------
-#      |  xskX   |     |     |  xskY   |
-#      -----------     |     -----------
-#           |          |          |
-#      -----------     |     ----------
-#      |  vethX  | --------- |  vethY |
-#      -----------   peer    ----------
+#      -----------   control    -----------
+#      | TX proc | ------------ | RX proc |
+#      -----------  (TCP, lo)   -----------
+#           |                        |
+#      -----------              -----------
+#      |  xskX   |              |  xskY   |
+#      -----------              -----------
+#           |                        |
+#      -----------              ----------
+#      |  vethX  | ------------ |  vethY |
+#      -----------     peer     ----------
+#
+# The two xskxceiver processes each drive one veth and synchronize over a
+# TCP control connection on 127.0.0.1.
 #
 # AF_XDP is an address family optimized for high performance packet processing,
 # it is XDP’s user-space interface.
@@ -71,6 +69,9 @@
 # Set up veth interfaces and leave them up so xskxceiver can be launched in a debugger:
 #   sudo ./test_xsk.sh -d
 #
+# Use a different TCP port for the control connection (default 35989)
+#   sudo ./test_xsk.sh -p PORT
+#
 # Run test suite in a specific mode only [skb,drv,zc]
 #   sudo ./test_xsk.sh -m MODE
 #
@@ -85,11 +86,15 @@
 
 . xsk_prereqs.sh
 
-while getopts "vdm:lt:h" flag
+PEER_HOST=127.0.0.1
+PEER_PORT=35989
+
+while getopts "vdm:lt:p:h" flag
 do
 	case "${flag}" in
 		v) verbose=1;;
 		d) debug=1;;
+		p) PEER_PORT=${OPTARG};;
 		m) MODE=${OPTARG};;
 		l) list=1;;
 		t) TEST=${OPTARG};;
@@ -186,7 +191,8 @@ statusList=()
 TEST_NAME="XSK_SELFTESTS_${VETH0}_SOFTIRQ"
 
 if [[ $debug -eq 1 ]]; then
-    echo "-i" ${VETH0} "-i" ${VETH1}
+    echo "./${XSKOBJ} -i ${VETH0} -e tx -p ${PEER_HOST} -P ${PEER_PORT} ${ARGS}"
+    echo "./${XSKOBJ} -i ${VETH1} -e rx -p ${PEER_HOST} -P ${PEER_PORT} ${ARGS}"
     exit
 fi
 
