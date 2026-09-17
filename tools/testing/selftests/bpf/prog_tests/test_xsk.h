@@ -145,7 +145,6 @@ struct ifobject {
 	bool busy_poll;
 	bool use_fill_ring;
 	bool release_rx;
-	bool shared_umem;
 	bool use_metadata;
 	bool unaligned_supp;
 	bool multi_buff_supp;

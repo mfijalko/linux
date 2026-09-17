@@ -341,7 +341,6 @@ int main(int argc, char **argv)
 	u32 i, j, failed_tests = 0, nb_tests;
 	int modes = TEST_MODE_SKB + 1;
 	struct test_spec test;
-	bool shared_netdev;
 	int ret;
 
 	/* Use libbpf 1.0 API mode */
@@ -388,12 +387,14 @@ int main(int argc, char **argv)
 		ksft_exit_xfail();
 	}
 
-	shared_netdev = (ifobj_tx->ifindex == ifobj_rx->ifindex);
-	ifobj_tx->shared_umem = shared_netdev;
-	ifobj_rx->shared_umem = shared_netdev;
-
 	if (!validate_interface(ifobj_tx) || !validate_interface(ifobj_rx))
 		print_usage(argv);
+
+	/* Two sockets on one queue would need one UMEM shared by both. */
+	if (ifobj_tx->ifindex == ifobj_rx->ifindex) {
+		ksft_print_msg("Error: the TX and RX interfaces must differ.\n");
+		ksft_exit_xfail();
+	}
 
 	if (is_xdp_supported(ifobj_tx->ifindex)) {
 		modes++;
