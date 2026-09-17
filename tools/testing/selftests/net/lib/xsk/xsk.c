@@ -802,6 +802,27 @@ int xsk_get_hw_ring_size(const char *ifname, struct ethtool_ringparam *ring)
 	return 0;
 }
 
+int xsk_get_mac(const char *ifname, u8 mac[ETH_ALEN])
+{
+	struct ifreq ifr = {};
+	int fd, err;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -errno;
+
+	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+	if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+		err = -errno;
+		close(fd);
+		return err;
+	}
+
+	close(fd);
+	memcpy(mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+	return 0;
+}
+
 int xsk_set_hw_ring_size(const char *ifname, struct ethtool_ringparam *ring)
 {
 	struct ifreq ifr = {};

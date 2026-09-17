@@ -244,6 +244,7 @@ void xsk_socket__delete(struct xsk_socket *xsk);
 int xsk_set_mtu(int ifindex, int mtu);
 
 int xsk_get_hw_ring_size(const char *ifname, struct ethtool_ringparam *ring);
+int xsk_get_mac(const char *ifname, u8 mac[ETH_ALEN]);
 int xsk_set_hw_ring_size(const char *ifname, struct ethtool_ringparam *ring);
 
 #ifdef __cplusplus
