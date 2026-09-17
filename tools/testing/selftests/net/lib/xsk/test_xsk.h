@@ -121,8 +121,27 @@ struct set_hw_ring {
 
 int hw_ring_size_reset(struct ifobject *ifobj);
 
+#define XSK_CAP_DRV              (1U << 0)
+#define XSK_CAP_ZC               (1U << 1)
+#define XSK_CAP_UNALIGNED        (1U << 2)
+#define XSK_CAP_MULTI_BUFF       (1U << 3)
+#define XSK_CAP_MULTI_BUFF_ZC    (1U << 4)
+#define XSK_CAP_HW_RING          (1U << 5)
+
+/* Sized in u32 words so the peer control channel can carry it verbatim. */
+struct xsk_caps {
+	u32 flags;
+	u32 xdp_zc_max_segs;
+	u32 max_skb_frags;
+	u32 umem_tailroom;
+	u32 tx_max_pending;
+	u8 mac[ETH_ALEN];
+	u8 pad[2];
+};
+
 struct ifobject {
 	char ifname[MAX_INTERFACE_NAME_CHARS];
+	struct xsk_caps caps;
 	struct xsk_socket_info *xsk;
 	struct xsk_socket_info *xsk_arr;
 	thread_func_t func_ptr;
@@ -136,9 +155,6 @@ struct ifobject {
 	int ifindex;
 	int mtu;
 	u32 bind_flags;
-	u32 xdp_zc_max_segs;
-	u32 umem_tailroom;
-	u32 max_skb_frags;
 	bool tx_on;
 	bool rx_on;
 	bool use_poll;
@@ -146,11 +162,13 @@ struct ifobject {
 	bool use_fill_ring;
 	bool release_rx;
 	bool use_metadata;
-	bool unaligned_supp;
-	bool multi_buff_supp;
-	bool multi_buff_zc_supp;
-	bool hw_ring_size_supp;
 };
+
+static inline bool ifobj_has_cap(const struct ifobject *ifobj, u32 cap)
+{
+	return ifobj->caps.flags & cap;
+}
+
 struct ifobject *ifobject_create(void);
 void ifobject_delete(struct ifobject *ifobj);
 int init_iface(struct ifobject *ifobj, thread_func_t func_ptr);
