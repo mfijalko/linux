@@ -13,6 +13,28 @@ else
 $(warning excluding iouring tests, liburing not installed or too old)
 endif
 
+TOOLSDIR := ../../../../..
+XSK_BPF_OUTPUT = $(abspath $(OUTPUT)/.xsk-bpf)/
+EXTRA_CLEAN += $(XSK_BPF_OUTPUT)
+
+# xskxceiver's BPF skeleton is built by recursing into the selftests/bpf
+# Makefile, which unconditionally requires a vmlinux with BTF (it errors
+# out at parse time otherwise). Probe for one the same way that Makefile
+# does, so a host/container without it just skips xskxceiver instead of
+# aborting the whole drivers/net/hw build.
+VMLINUX_BTF_PATHS ?= $(if $(O),$(O)/vmlinux)				\
+		     $(if $(KBUILD_OUTPUT),$(KBUILD_OUTPUT)/vmlinux)	\
+		     $(TOOLSDIR)/../vmlinux				\
+		     /sys/kernel/btf/vmlinux				\
+		     /boot/vmlinux-$(shell uname -r)
+HAS_VMLINUX_BTF := $(if $(wildcard $(VMLINUX_BTF_PATHS)),y)
+
+ifeq ($(HAS_VMLINUX_BTF),y)
+COND_GEN_FILES += xskxceiver
+else
+$(warning excluding xskxceiver test, no vmlinux BTF found (required to build its BPF skeleton))
+endif
+
 TEST_GEN_FILES := \
 	$(COND_GEN_FILES) \
 # end of TEST_GEN_FILES
@@ -50,6 +72,7 @@ TEST_PROGS = \
 	userns_devmem.py \
 	uso.py \
 	xdp_metadata.py \
+	xsk.py \
 	xsk_reconfig.py \
 	#
 
@@ -93,3 +116,23 @@ include ../../../net/bpf.mk
 ifeq ($(HAS_IOURING_ZCRX),y)
 $(OUTPUT)/iou-zcrx: LDLIBS += -luring
 endif
+
+# xsk.py deploys xskxceiver to a remote host whose libc may be older than
+# the build host's, so link it statically whenever the toolchain has the
+# static libraries. XSK_STATIC=0/1 overrides the probe.
+ifeq ($(HAS_VMLINUX_BTF),y)
+PKG_CONFIG ?= $(CROSS_COMPILE)pkg-config
+XSK_STATIC_LIBS := $(shell $(PKG_CONFIG) libelf --static --libs 2>/dev/null || echo -lelf -lz -lzstd)
+XSK_STATIC ?= $(shell echo 'int main(void) { return 0; }' | \
+	$(CC) -x c - -static $(XSK_STATIC_LIBS) -lz -o /dev/null 2>/dev/null && echo 1)
+endif
+
+# Let selftests/bpf own dependency tracking for the shared helper.
+$(OUTPUT)/xskxceiver: FORCE
+	$(Q)mkdir -p $(XSK_BPF_OUTPUT)
+	+$(Q)$(MAKE) -C ../../../bpf OUTPUT=$(XSK_BPF_OUTPUT) \
+		XSK_STATIC=$(XSK_STATIC) xskxceiver
+	$(Q)cp $(XSK_BPF_OUTPUT)/xskxceiver $@
+
+.PHONY: FORCE
+FORCE:

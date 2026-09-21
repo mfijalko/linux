@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <linux/ethtool.h>
 #include <linux/if_xdp.h>
 
 #include <bpf/libbpf.h>
@@ -241,6 +242,11 @@ int xsk_umem__delete(struct xsk_umem *umem);
 void xsk_socket__delete(struct xsk_socket *xsk);
 
 int xsk_set_mtu(int ifindex, int mtu);
+
+int xsk_get_hw_ring_size(const char *ifname, struct ethtool_ringparam *ring);
+int xsk_get_driver(const char *ifname, char *driver, size_t len);
+int xsk_get_mac(const char *ifname, u8 mac[ETH_ALEN]);
+int xsk_set_hw_ring_size(const char *ifname, struct ethtool_ringparam *ring);
 
 #ifdef __cplusplus
 } /* extern "C" */

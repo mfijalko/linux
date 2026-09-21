@@ -5,7 +5,7 @@
 #include <linux/ethtool.h>
 #include <linux/if_xdp.h>
 
-#include "../kselftest.h"
+#include "../../../kselftest.h"
 #include "xsk.h"
 
 #ifndef SO_PREFER_BUSY_POLL
@@ -77,8 +77,21 @@ enum test_mode {
 struct ifobject;
 struct test_spec;
 typedef int (*validation_func_t)(struct ifobject *ifobj);
-typedef void *(*thread_func_t)(void *arg);
 typedef int (*test_func_t)(struct test_spec *test);
+
+enum xsk_endpoint_role {
+	XSK_ENDPOINT_NONE,
+	XSK_ENDPOINT_RX,
+	XSK_ENDPOINT_TX,
+};
+
+struct xsk_peer;
+
+/* The interface this process drives and the control channel to the other one. */
+void xsk_set_endpoint(struct xsk_peer *peer, struct ifobject *owned);
+
+/* Packets TX has sent that RX has not yet reported consumed. */
+extern int pkts_in_flight;
 
 struct xsk_socket_info {
 	struct xsk_ring_cons rx;
@@ -121,11 +134,31 @@ struct set_hw_ring {
 
 int hw_ring_size_reset(struct ifobject *ifobj);
 
+#define XSK_CAP_DRV              (1U << 0)
+#define XSK_CAP_ZC               (1U << 1)
+#define XSK_CAP_UNALIGNED        (1U << 2)
+#define XSK_CAP_MULTI_BUFF       (1U << 3)
+#define XSK_CAP_MULTI_BUFF_ZC    (1U << 4)
+#define XSK_CAP_HW_RING          (1U << 5)
+/* Frames must carry the real interface MACs to reach the peer. */
+#define XSK_CAP_MAC_FILTER       (1U << 6)
+
+/* Sized in u32 words so the peer control channel can carry it verbatim. */
+struct xsk_caps {
+	u32 flags;
+	u32 xdp_zc_max_segs;
+	u32 max_skb_frags;
+	u32 umem_tailroom;
+	u32 tx_max_pending;
+	u8 mac[ETH_ALEN];
+	u8 pad[2];
+};
+
 struct ifobject {
 	char ifname[MAX_INTERFACE_NAME_CHARS];
+	struct xsk_caps caps;
 	struct xsk_socket_info *xsk;
 	struct xsk_socket_info *xsk_arr;
-	thread_func_t func_ptr;
 	validation_func_t validation_func;
 	struct xsk_xdp_progs *xdp_progs;
 	struct bpf_map *xskmap;
@@ -136,25 +169,24 @@ struct ifobject {
 	int ifindex;
 	int mtu;
 	u32 bind_flags;
-	u32 xdp_zc_max_segs;
-	u32 umem_tailroom;
-	u32 max_skb_frags;
 	bool tx_on;
 	bool rx_on;
 	bool use_poll;
 	bool busy_poll;
 	bool use_fill_ring;
 	bool release_rx;
-	bool shared_umem;
 	bool use_metadata;
-	bool unaligned_supp;
-	bool multi_buff_supp;
-	bool multi_buff_zc_supp;
-	bool hw_ring_size_supp;
 };
+
+static inline bool ifobj_has_cap(const struct ifobject *ifobj, u32 cap)
+{
+	return ifobj->caps.flags & cap;
+}
+
 struct ifobject *ifobject_create(void);
 void ifobject_delete(struct ifobject *ifobj);
-int init_iface(struct ifobject *ifobj, thread_func_t func_ptr);
+int init_iface(struct ifobject *ifobj);
+int xsk_load_xdp_programs(struct ifobject *ifobj);
 
 int xsk_configure_umem(struct ifobject *ifobj, struct xsk_umem_info *umem, void *buffer, u64 size);
 int xsk_configure_socket(struct xsk_socket_info *xsk, struct xsk_umem_info *umem,
@@ -203,12 +235,10 @@ struct test_spec {
 	u16 total_steps;
 	u16 current_step;
 	u16 nb_sockets;
-	bool fail;
 	bool set_ring;
 	bool adjust_tail;
 	bool adjust_tail_support;
 	bool poll_tmout;
-	bool use_barrier;
 	enum test_mode mode;
 	char name[MAX_TEST_NAME_SIZE];
 };
@@ -268,9 +298,6 @@ int testapp_xdp_metadata(struct test_spec *test);
 int testapp_xdp_metadata_mb(struct test_spec *test);
 int testapp_xdp_prog_cleanup(struct test_spec *test);
 int testapp_xdp_shared_umem(struct test_spec *test);
-
-void *worker_testapp_validate_rx(void *arg);
-void *worker_testapp_validate_tx(void *arg);
 
 static const struct test_spec tests[] = {
 	{.name = "SEND_RECEIVE", .test_func = testapp_send_receive},

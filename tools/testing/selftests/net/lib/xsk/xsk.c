@@ -35,7 +35,6 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include "xsk.h"
-#include "bpf_util.h"
 
 #ifndef SOL_XDP
  #define SOL_XDP 283
@@ -778,4 +777,96 @@ void xsk_socket__delete(struct xsk_socket *xsk)
 	if (xsk->fd != umem->fd)
 		close(xsk->fd);
 	free(xsk);
+}
+
+int xsk_get_hw_ring_size(const char *ifname, struct ethtool_ringparam *ring)
+{
+	struct ifreq ifr = {};
+	int fd, err;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -errno;
+
+	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+	ring->cmd = ETHTOOL_GRINGPARAM;
+	ifr.ifr_data = (char *)ring;
+
+	if (ioctl(fd, SIOCETHTOOL, &ifr) < 0) {
+		err = -errno;
+		close(fd);
+		return err;
+	}
+
+	close(fd);
+	return 0;
+}
+
+int xsk_get_driver(const char *ifname, char *driver, size_t len)
+{
+	struct ethtool_drvinfo info = { .cmd = ETHTOOL_GDRVINFO };
+	struct ifreq ifr = {};
+	int fd, err;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -errno;
+
+	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+	ifr.ifr_data = (char *)&info;
+
+	if (ioctl(fd, SIOCETHTOOL, &ifr) < 0) {
+		err = -errno;
+		close(fd);
+		return err;
+	}
+
+	close(fd);
+	strncpy(driver, info.driver, len - 1);
+	driver[len - 1] = '\0';
+	return 0;
+}
+
+int xsk_get_mac(const char *ifname, u8 mac[ETH_ALEN])
+{
+	struct ifreq ifr = {};
+	int fd, err;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -errno;
+
+	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+	if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+		err = -errno;
+		close(fd);
+		return err;
+	}
+
+	close(fd);
+	memcpy(mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+	return 0;
+}
+
+int xsk_set_hw_ring_size(const char *ifname, struct ethtool_ringparam *ring)
+{
+	struct ifreq ifr = {};
+	int fd, err;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -errno;
+
+	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+	ring->cmd = ETHTOOL_SRINGPARAM;
+	ifr.ifr_data = (char *)ring;
+
+	if (ioctl(fd, SIOCETHTOOL, &ifr) < 0) {
+		err = -errno;
+		close(fd);
+		return err;
+	}
+
+	close(fd);
+	return 0;
 }
