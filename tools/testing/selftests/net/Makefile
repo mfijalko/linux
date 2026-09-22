@@ -260,7 +260,7 @@ include $(top_srcdir)/tools/scripts/Makefile.arch
 XSK_DIR := lib/xsk
 XSK_BPF_OBJ := $(OUTPUT)/xsk_xdp_progs.bpf.o
 XSK_SKEL := $(OUTPUT)/xsk_xdp_progs.skel.h
-XSK_SOURCES := $(addprefix $(XSK_DIR)/,xskxceiver.c xsk.c test_xsk.c) \
+XSK_SOURCES := $(addprefix $(XSK_DIR)/,xskxceiver.c xsk.c test_xsk.c xsk_peer.c) \
 	$(top_srcdir)/tools/lib/find_bit.c
 XSK_HEADERS := $(wildcard $(XSK_DIR)/*.h)
 XSK_CFLAGS := -I$(top_srcdir)/tools/include \
