@@ -119,14 +119,13 @@ TEST_GEN_PROGS += test_progs-cpuv4
 TEST_INST_SUBDIRS += cpuv4
 endif
 
-TEST_FILES = xsk_prereqs.sh $(wildcard progs/btf_dump_test_case_*.c)
+TEST_FILES = $(wildcard progs/btf_dump_test_case_*.c)
 
 # Order correspond to 'make run_tests' order
 TEST_PROGS := test_kmod.sh \
 	test_lirc_mode2.sh \
 	test_bpftool_build.sh \
 	test_doc_build.sh \
-	test_xsk.sh \
 	test_xdp_features.sh
 
 TEST_PROGS_EXTENDED := \
@@ -145,8 +144,7 @@ TEST_GEN_PROGS_EXTENDED = \
 	veristat \
 	xdp_features \
 	xdp_hw_metadata \
-	xdp_synproxy \
-	xskxceiver
+	xdp_synproxy
 
 TEST_GEN_FILES += $(TEST_KMODS) liburandom_read.so urandom_read sign-file uprobe_multi
 
@@ -465,7 +463,6 @@ CLANG_SYS_INCLUDES = $(call get_sys_includes,$(CLANG),$(CLANG_TARGET_ARCH))
 BPF_CFLAGS = -g -Wall -Werror -D__TARGET_ARCH_$(SRCARCH) $(MENDIAN)	\
 	     -I$(INCLUDE_DIR) -I$(CURDIR) -I$(APIDIR)			\
 	     -I$(TOOLSINCDIR) -I$(CURDIR)/libarena/include		\
-	     -I$(CURDIR)/../net/lib/xsk				\
 	     -I$(abspath $(OUTPUT)/../usr/include)			\
 	     -std=gnu11		 					\
 	     -fno-strict-aliasing 					\
@@ -544,7 +541,6 @@ linked_maps.skel.h-deps := linked_maps1.bpf.o linked_maps2.bpf.o
 test_subskeleton.skel.h-deps := test_subskeleton_lib2.bpf.o test_subskeleton_lib.bpf.o test_subskeleton.bpf.o
 test_subskeleton_lib.skel.h-deps := test_subskeleton_lib2.bpf.o test_subskeleton_lib.bpf.o
 test_usdt.skel.h-deps := test_usdt.bpf.o test_usdt_multispec.bpf.o
-xsk_xdp_progs.skel.h-deps := xsk_xdp_progs.bpf.o
 xdp_hw_metadata.skel.h-deps := xdp_hw_metadata.bpf.o
 xdp_features.skel.h-deps := xdp_features.bpf.o
 tracing_multi.skel.h-deps := tracing_multi_attach.bpf.o tracing_multi_check.bpf.o
@@ -628,8 +624,6 @@ $(TRUNNER_BPF_OBJS): $(TRUNNER_OUTPUT)/%.bpf.o:				\
 					  $(TRUNNER_BPF_CFLAGS)         \
 					  $$($$<-CFLAGS)		\
 					  $$($$<-$2-CFLAGS),$(TRUNNER_BINARY))
-
-$(TRUNNER_OUTPUT)/xsk_xdp_progs.bpf.o: ../net/lib/xsk/xsk_xdp_common.h
 
 $(TRUNNER_BPF_SKELS): %.skel.h: %.bpf.o $(BPFTOOL) | $(TRUNNER_OUTPUT)
 	$(Q)$(if $(PERMISSIVE),if [ ! -f $$< ]; then			\
@@ -774,10 +768,6 @@ $(TRUNNER_EXTRA_OBJS): $(TRUNNER_OUTPUT)/%.o:				\
 	$(Q)$$(CC) $$(CFLAGS) -c $$< $$(LDLIBS) -o $$@
 
 $(TRUNNER_OUTPUT)/xsk.o: ../net/lib/xsk/xsk.h
-$(TRUNNER_OUTPUT)/test_xsk.o: ../net/lib/xsk/test_xsk.h \
-			    ../net/lib/xsk/xsk.h ../net/lib/xsk/xsk_xdp_common.h \
-			    $(TRUNNER_OUTPUT)/xsk_xdp_progs.skel.h
-
 $(TRUNNER_LIB_OBJS): $(TRUNNER_OUTPUT)/%.o:$(TOOLSDIR)/lib/%.c
 	$$(call msg,LIB-OBJ,$(TRUNNER_BINARY),$$@)
 	$(Q)$$(CC) $$(CFLAGS) -c $$< $$(LDLIBS) -o $$@
@@ -854,8 +844,8 @@ $(LIBARENA_ASAN_SKEL): $(INCLUDE_DIR)/vmlinux.h $(BPFOBJ) $(LIBARENA_BPF_DEPS)
 	+$(MAKE) -C libarena libarena_asan.skel.h $(LIBARENA_MAKE_ARGS)
 endif
 
-# xsk.c and test_xsk.c live in ../net/lib/xsk so they can be shared with
-# drivers/net/hw; let make find them there instead of keeping local copies.
+# xsk.c lives in ../net/lib/xsk so it can be shared with selftests/net;
+# let make find it there instead of keeping a local copy.
 vpath %.c ../net/lib/xsk
 
 # Define test_progs test runner.
@@ -875,7 +865,6 @@ TRUNNER_EXTRA_SOURCES := test_progs.c		\
 			 io_helpers.c		\
 			 test_loader.c		\
 			 xsk.c			\
-			 test_xsk.c		\
 			 disasm.c		\
 			 disasm_helpers.c	\
 			 json_writer.c 		\
@@ -942,17 +931,6 @@ verifier/tests.h: verifier/*.c
 		  echo '#endif' \
 		) > verifier/tests.h)
 $(OUTPUT)/test_verifier: test_verifier.c verifier/tests.h $(BPFOBJ) | $(OUTPUT)
-	$(call msg,BINARY,,$@)
-	$(Q)$(CC) $(CFLAGS) $(filter %.a %.o %.c,$^) $(LDLIBS) -o $@
-
-# Keep xskxceiver independent from test_progs object dependencies.
-# xskxceiver.c, xsk.c, test_xsk.c and their headers live in ../net/lib/xsk
-# so they can be shared with drivers/net/hw.
-$(OUTPUT)/xskxceiver: ../net/lib/xsk/xskxceiver.c ../net/lib/xsk/xsk.c \
-			   $(TOOLSDIR)/lib/find_bit.c ../net/lib/xsk/test_xsk.c \
-			   ../net/lib/xsk/xskxceiver.h ../net/lib/xsk/xsk.h \
-			   ../net/lib/xsk/test_xsk.h ../net/lib/xsk/xsk_xdp_common.h \
-			   $(OUTPUT)/xsk_xdp_progs.skel.h $(BPFOBJ) | $(OUTPUT)
 	$(call msg,BINARY,,$@)
 	$(Q)$(CC) $(CFLAGS) $(filter %.a %.o %.c,$^) $(LDLIBS) -o $@
 

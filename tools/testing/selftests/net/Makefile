@@ -5,6 +5,8 @@ CFLAGS += -Wall -Wl,--no-as-needed -O2 -g
 CFLAGS += -I../../../../usr/include/ $(KHDR_INCLUDES)
 # Additional include paths needed by kselftest.h
 CFLAGS += -I../
+BPFTOOL ?= bpftool
+HAS_BPFTOOL := $(shell command -v $(BPFTOOL) >/dev/null 2>&1 && echo y)
 
 TEST_PROGS := \
 	altnames.sh \
@@ -108,6 +110,7 @@ TEST_PROGS := \
 	test_bridge_neigh_suppress.sh \
 	test_ingress_egress_chaining.sh \
 	test_neigh.sh \
+	test_xsk.sh \
 	test_so_rcv.sh \
 	test_vxlan_fdb_changelink.sh \
 	test_vxlan_mdb.sh \
@@ -200,11 +203,18 @@ TEST_GEN_PROGS := \
 	tls \
 # end of TEST_GEN_PROGS
 
+ifeq ($(HAS_BPFTOOL),y)
+TEST_GEN_PROGS += xskxceiver
+else
+$(warning excluding xskxceiver test, bpftool not found)
+endif
+
 TEST_FILES := \
 	fcnal-test.sh \
 	in_netns.sh \
 	lib.sh \
 	settings \
+	xsk_prereqs.sh \
 # end of TEST_FILES
 
 # YNL files, must be before "include ..lib.mk"
@@ -242,3 +252,43 @@ $(OUTPUT)/bind_bhash: LDLIBS += -lpthread
 $(OUTPUT)/io_uring_zerocopy_tx: CFLAGS += -I../../../include/
 
 include bpf.mk
+include $(top_srcdir)/tools/scripts/Makefile.arch
+
+# AF_XDP test engine shared by the veth and hardware selftests.  Keep its
+# BPF object and userspace binary here so neither caller depends on the
+# selftests/bpf build machinery.
+XSK_DIR := lib/xsk
+XSK_BPF_OBJ := $(OUTPUT)/xsk_xdp_progs.bpf.o
+XSK_SKEL := $(OUTPUT)/xsk_xdp_progs.skel.h
+XSK_SOURCES := $(addprefix $(XSK_DIR)/,xskxceiver.c xsk.c test_xsk.c) \
+	$(top_srcdir)/tools/lib/find_bit.c
+XSK_HEADERS := $(wildcard $(XSK_DIR)/*.h)
+XSK_CFLAGS := -I$(top_srcdir)/tools/include \
+	-I$(top_srcdir)/tools/arch/$(SRCARCH)/include \
+	-I$(top_srcdir)/tools/include/uapi \
+	-I$(top_srcdir)/tools/lib
+ifeq ($(XSK_STATIC),1)
+XSK_LDLIBS := -static $(shell pkg-config libelf --static --libs 2>/dev/null || echo -lelf -lz -lzstd) -lz -lrt
+else
+XSK_LDLIBS := -lelf -lz -lzstd -lrt
+endif
+
+$(XSK_BPF_OBJ): $(XSK_DIR)/xsk_xdp_progs.bpf.c $(XSK_DIR)/xsk_xdp_common.h $(BPFOBJ)
+	$(call msg,BPF_PROG,,$@)
+	$(Q)$(CLANG) -O2 -g --target=bpf $(CCINCLUDE) $(CLANG_SYS_INCLUDES) \
+		-I$(XSK_DIR) -c $< -o $@
+
+$(XSK_SKEL): $(XSK_BPF_OBJ)
+	$(call msg,SKEL,,$@)
+	$(Q)$(BPFTOOL) gen skeleton $< name xsk_xdp_progs > $@
+
+$(OUTPUT)/xskxceiver: $(XSK_SOURCES) $(XSK_HEADERS) $(XSK_SKEL) $(BPFOBJ)
+	$(call msg,CC,,$@)
+	$(Q)$(CC) $(CFLAGS) $(XSK_CFLAGS) -I$(XSK_DIR) -I$(OUTPUT) \
+		-I$(SCRATCH_DIR)/include \
+		$(XSK_SOURCES) $(BPFOBJ) $(LDLIBS) $(XSK_LDLIBS) -lpthread -o $@
+
+.PHONY: xskxceiver
+xskxceiver: $(OUTPUT)/xskxceiver
+
+EXTRA_CLEAN += $(XSK_BPF_OBJ) $(XSK_SKEL)
