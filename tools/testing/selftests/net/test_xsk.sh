@@ -8,22 +8,20 @@
 #
 # Topology:
 # ---------
-#                 -----------
-#               _ | Process | _
-#              /  -----------  \
-#             /        |        \
-#            /         |         \
-#      -----------     |     -----------
-#      | Thread1 |     |     | Thread2 |
-#      -----------     |     -----------
-#           |          |          |
-#      -----------     |     -----------
-#      |  xskX   |     |     |  xskY   |
-#      -----------     |     -----------
-#           |          |          |
-#      -----------     |     ----------
-#      |  vethX  | --------- |  vethY |
-#      -----------   peer    ----------
+#      -----------   control    -----------
+#      | TX proc | ------------ | RX proc |
+#      -----------  (TCP, lo)   -----------
+#           |                        |
+#      -----------              -----------
+#      |  xskX   |              |  xskY   |
+#      -----------              -----------
+#           |                        |
+#      -----------              ----------
+#      |  vethX  | ------------ |  vethY |
+#      -----------     peer     ----------
+#
+# The two xskxceiver processes each drive one veth and synchronize over a
+# TCP control connection on 127.0.0.1.
 #
 # AF_XDP is an address family optimized for high performance packet processing,
 # it is XDP’s user-space interface.
@@ -71,7 +69,10 @@
 # Set up veth interfaces and leave them up so xskxceiver can be launched in a debugger:
 #   sudo ./test_xsk.sh -d
 #
-# Run test suite in a specific mode only [skb,drv,zc]
+# Use a specific TCP port for the control connection (random by default)
+#   sudo ./test_xsk.sh -p PORT
+#
+# Run test suite in a specific mode only [skb,drv]
 #   sudo ./test_xsk.sh -m MODE
 #
 # List available tests
@@ -85,11 +86,20 @@
 
 . xsk_prereqs.sh
 
-while getopts "vdm:lt:h" flag
+if [ ! -x "./${XSKOBJ}" ]; then
+	echo "xskxceiver was not built; skipping"
+	exit $ksft_skip
+fi
+
+PEER_HOST=127.0.0.1
+PEER_PORT=
+
+while getopts "vdm:lt:p:h" flag
 do
 	case "${flag}" in
 		v) verbose=1;;
 		d) debug=1;;
+		p) PEER_PORT=${OPTARG};;
 		m) MODE=${OPTARG};;
 		l) list=1;;
 		t) TEST=${OPTARG};;
@@ -102,9 +112,11 @@ TEST_NAME="PREREQUISITES"
 URANDOM=/dev/urandom
 [ ! -e "${URANDOM}" ] && { echo "${URANDOM} not found. Skipping tests."; test_exit $ksft_fail; }
 
-VETH0_POSTFIX=$(cat ${URANDOM} | tr -dc '0-9' | fold -w 256 | head -n 1 | head --bytes 4)
+VETH0_POSTFIX=$(od -An -N2 -tu2 ${URANDOM})
+VETH0_POSTFIX=$(printf "%04d" $((VETH0_POSTFIX % 10000)))
 VETH0=ve${VETH0_POSTFIX}
-VETH1_POSTFIX=$(cat ${URANDOM} | tr -dc '0-9' | fold -w 256 | head -n 1 | head --bytes 4)
+VETH1_POSTFIX=$(od -An -N2 -tu2 ${URANDOM})
+VETH1_POSTFIX=$(printf "%04d" $((VETH1_POSTFIX % 10000)))
 VETH1=ve${VETH1_POSTFIX}
 MTU=1500
 
@@ -119,7 +131,8 @@ setup_vethPairs() {
 	if [[ $verbose -eq 1 ]]; then
 	        echo "setting up ${VETH0}"
 	fi
-	ip link add ${VETH0} numtxqueues 4 numrxqueues 4 type veth peer name ${VETH1} numtxqueues 4 numrxqueues 4
+	ip link add ${VETH0} numtxqueues 4 numrxqueues 4 type veth \
+		peer name ${VETH1} numtxqueues 4 numrxqueues 4
 	if [ -f /proc/net/if_inet6 ]; then
 		echo 1 > /proc/sys/net/ipv6/conf/${VETH0}/disable_ipv6
 		echo 1 > /proc/sys/net/ipv6/conf/${VETH1}/disable_ipv6
@@ -151,6 +164,23 @@ if [[ $help -eq 1 ]]; then
         exit
 fi
 
+if [ -n "$MODE" ]; then
+	case "$MODE" in
+		skb|drv) MODES=("$MODE");;
+		*) echo "Unsupported veth mode: $MODE (expected skb or drv)" >&2
+		   exit 1;;
+	esac
+else
+	MODES=(skb drv)
+fi
+
+if [ -z "$PEER_PORT" ]; then
+	PEER_PORT=$(random_port) || {
+		echo "Could not find an unused TCP port" >&2
+		exit 1
+	}
+fi
+
 validate_root_exec
 validate_veth_support ${VETH0}
 validate_ip_utility
@@ -168,12 +198,19 @@ if [[ $verbose -eq 1 ]]; then
 	ARGS+="-v "
 fi
 
-if [ -n "$MODE" ]; then
-	ARGS+="-m ${MODE} "
-fi
-
 if [ -n "$TEST" ]; then
-	ARGS+="-t ${TEST} "
+	if [[ "$TEST" =~ ^[0-9]+$ ]]; then
+		CASES=("$TEST")
+	else
+		mapfile -t CASES < <(./${XSKOBJ} -l |
+			awk -F ': ' -v name="$TEST" '$2 == name {print $1}')
+	fi
+else
+	mapfile -t CASES < <(./${XSKOBJ} -l | awk -F ': ' '/^[0-9]+: / {print $1}')
+fi
+if [ ${#CASES[@]} -eq 0 ]; then
+	echo "Unknown AF_XDP test: $TEST" >&2
+	exit 1
 fi
 
 retval=$?
@@ -182,15 +219,33 @@ test_status $retval "${TEST_NAME}"
 ## START TESTS
 
 statusList=()
+nameList=()
 
-TEST_NAME="XSK_SELFTESTS_${VETH0}_SOFTIRQ"
+run_matrix()
+{
+	local mode case_id
+
+	for mode in "${MODES[@]}"; do
+		for case_id in "${CASES[@]}"; do
+			ARGS="${BASE_ARGS} -m ${mode} -t ${case_id}"
+			TEST_NAME="XSK_${mode}_${case_id}_${RUN_VARIANT}_${VETH0}"
+			exec_xskxceiver
+		done
+	done
+}
+
+BASE_ARGS="${ARGS}"
+
+RUN_VARIANT=SOFTIRQ
 
 if [[ $debug -eq 1 ]]; then
-    echo "-i" ${VETH0} "-i" ${VETH1}
+    ARGS="${BASE_ARGS} -m ${MODES[0]} -t ${CASES[0]}"
+    echo "./${XSKOBJ} -i ${VETH0} -e tx -p ${PEER_HOST} -P ${PEER_PORT} ${ARGS}"
+    echo "./${XSKOBJ} -i ${VETH1} -e rx -p ${PEER_HOST} -P ${PEER_PORT} ${ARGS}"
     exit
 fi
 
-exec_xskxceiver
+run_matrix
 
 cleanup_exit ${VETH0} ${VETH1}
 
@@ -198,28 +253,47 @@ if [[ $list -eq 1 ]]; then
     exit
 fi
 
-TEST_NAME="XSK_SELFTESTS_${VETH0}_BUSY_POLL"
+RUN_VARIANT=BUSY_POLL
 busy_poll=1
 
 setup_vethPairs
-exec_xskxceiver
+run_matrix
 
 ## END TESTS
 
 cleanup_exit ${VETH0} ${VETH1}
 
+passes=0
+skips=0
 failures=0
-echo -e "\nSummary:"
+failed_tests=()
 for i in "${!statusList[@]}"
 do
-	if [ ${statusList[$i]} -ne 0 ]; then
-	        test_status ${statusList[$i]} ${nameList[$i]}
-		failures=1
-	fi
+	case ${statusList[$i]} in
+		$ksft_pass)
+			passes=$((passes + 1))
+			;;
+		$ksft_skip)
+			skips=$((skips + 1))
+			;;
+		*)
+			failures=$((failures + 1))
+			failed_tests+=("${nameList[$i]}")
+			;;
+	esac
 done
 
-if [ $failures -eq 0 ]; then
-        echo "All tests successful!"
-else
+echo
+echo "Summary:"
+printf "  Tests:   %d\n" "${#statusList[@]}"
+printf "  Passed:  %d\n" "$passes"
+printf "  Skipped: %d\n" "$skips"
+printf "  Failed:  %d\n" "$failures"
+
+if [ $failures -ne 0 ]; then
+	echo "Failed tests:"
+	for TEST_NAME in "${failed_tests[@]}"; do
+		echo "  $TEST_NAME"
+	done
 	exit 1
 fi

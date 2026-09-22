@@ -6,8 +6,9 @@
 #include <linux/if_link.h>
 #include <linux/mman.h>
 #include <linux/netdev.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
 #include <poll.h>
-#include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -15,6 +16,7 @@
 #include <unistd.h>
 
 #include "test_xsk.h"
+#include "xsk_peer.h"
 #include "xsk_xdp_common.h"
 #include "xsk_xdp_progs.skel.h"
 
@@ -27,8 +29,11 @@
 #define PKT_DUMP_NB_TO_PRINT		16
 /* Just to align the data in the packet */
 #define PKT_HDR_SIZE			(sizeof(struct ethhdr) + 2)
+#define UDP_PKT_HDR_SIZE		(sizeof(struct ethhdr) + sizeof(struct iphdr) + \
+				 sizeof(struct udphdr) + 2)
 #define POLL_TMOUT			1000
 #define THREAD_TMOUT			3
+#define HW_THREAD_TMOUT		20
 #define UMEM_HEADROOM_TEST_SIZE		128
 #define XSK_DESC__INVALID_OPTION	(0xffff)
 #define XSK_UMEM__INVALID_FRAME_SIZE	(MAX_ETH_JUMBO_SIZE + 1)
@@ -36,12 +41,57 @@
 #define XSK_UMEM__MAX_FRAME_SIZE	(4 * 1024)
 
 static const u8 g_mac[ETH_ALEN] = {0x55, 0x44, 0x33, 0x22, 0x11, 0x00};
+static bool udp_packets;
+static struct in_addr udp_src_ip;
+static struct in_addr udp_dst_ip;
+static u16 udp_port;
+static u32 pkt_hdr_size = PKT_HDR_SIZE;
+static u32 max_frags_override;
 
 bool opt_verbose;
-pthread_barrier_t barr;
-pthread_mutex_t pacing_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int pkts_in_flight;
+static struct xsk_peer *ctrl_peer;
+static struct ifobject *ep_ifobj;
+static bool hw_test;
+static bool remote_traffic_active;
+
+void xsk_set_endpoint(struct xsk_peer *peer, struct ifobject *owned, bool hardware)
+{
+	ctrl_peer = peer;
+	ep_ifobj = owned;
+	hw_test = hardware;
+}
+
+static bool endpoint_owns(struct ifobject *ifobj)
+{
+	return ifobj == ep_ifobj;
+}
+
+static int pacing_rx_progress(u32 pkts)
+{
+	int err = xsk_peer_rx_progress(ctrl_peer, pkts);
+
+	if (err)
+		ksft_print_msg("RX control channel failed: %d (%s)\n", err,
+			       strerror(-err));
+	return err;
+}
+
+static int pacing_tx_sync(void)
+{
+	int err;
+
+	if (!remote_traffic_active) {
+		pkts_in_flight = 0;
+		return 0;
+	}
+	err = xsk_peer_tx_sync(ctrl_peer);
+	if (err)
+		ksft_print_msg("TX control channel failed: %d (%s)\n", err,
+			       strerror(-err));
+	return err;
+}
 
 /* The payload is a word consisting of a packet sequence number in the upper
  * 16-bits and a intra packet data sequence number in the lower 16 bits. So the 3rd packet's
@@ -57,11 +107,69 @@ static void write_payload(void *dest, u32 pkt_nb, u32 start, u32 size)
 		ptr[i] = htonl(pkt_nb << 16 | (i + start));
 }
 
-static void gen_eth_hdr(struct xsk_socket_info *xsk, struct ethhdr *eth_hdr)
+int xsk_set_udp_packet_format(const char *src_ip, const char *dst_ip, u16 port)
 {
+	if (inet_pton(AF_INET, src_ip, &udp_src_ip) != 1 ||
+	    inet_pton(AF_INET, dst_ip, &udp_dst_ip) != 1 || !port)
+		return -EINVAL;
+	udp_packets = true;
+	udp_port = port;
+	pkt_hdr_size = UDP_PKT_HDR_SIZE;
+	return 0;
+}
+
+void xsk_set_max_frags(u32 max_frags)
+{
+	max_frags_override = max_frags;
+}
+
+static u16 ip_checksum(const void *buf, size_t len)
+{
+	const u16 *word = buf;
+	u32 sum = 0;
+
+	while (len > 1) {
+		sum += *word++;
+		len -= sizeof(*word);
+	}
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return ~sum;
+}
+
+static void gen_pkt_hdr(struct xsk_socket_info *xsk, void *data, u32 total_len)
+{
+	struct ethhdr *eth_hdr = data;
+	struct iphdr ip = {
+		.version = 4,
+		.ihl = 5,
+		.ttl = 64,
+		.protocol = IPPROTO_UDP,
+		.tot_len = htons(total_len - sizeof(*eth_hdr)),
+		.saddr = udp_src_ip.s_addr,
+		.daddr = udp_dst_ip.s_addr,
+	};
+	struct udphdr udp = {
+		.source = htons(udp_port),
+		.dest = htons(udp_port),
+		.len = htons(total_len - sizeof(*eth_hdr) - sizeof(ip)),
+	};
+	u8 *ptr = data;
+
 	memcpy(eth_hdr->h_dest, xsk->dst_mac, ETH_ALEN);
 	memcpy(eth_hdr->h_source, xsk->src_mac, ETH_ALEN);
-	eth_hdr->h_proto = htons(ETH_P_LOOPBACK);
+	if (!udp_packets) {
+		eth_hdr->h_proto = htons(ETH_P_LOOPBACK);
+		return;
+	}
+
+	eth_hdr->h_proto = htons(ETH_P_IP);
+	ip.check = ip_checksum(&ip, sizeof(ip));
+	ptr += sizeof(*eth_hdr);
+	memcpy(ptr, &ip, sizeof(ip));
+	ptr += sizeof(ip);
+	memcpy(ptr, &udp, sizeof(udp));
+	memset(ptr + sizeof(udp), 0, 2);
 }
 
 static u32 mode_to_xdp_flags(enum test_mode mode)
@@ -166,7 +274,8 @@ int xsk_configure_socket(struct xsk_socket_info *xsk, struct xsk_umem_info *umem
 
 	txr = ifobject->tx_on ? &xsk->tx : NULL;
 	rxr = ifobject->rx_on ? &xsk->rx : NULL;
-	return xsk_socket__create(&xsk->xsk, ifobject->ifindex, 0, umem->umem, rxr, txr, &cfg);
+	return xsk_socket__create(&xsk->xsk, ifobject->ifindex, ifobject->queue_id,
+				  umem->umem, rxr, txr, &cfg);
 }
 
 static int set_ring_size(struct ifobject *ifobj)
@@ -191,6 +300,10 @@ static int set_ring_size(struct ifobject *ifobj)
 
 int hw_ring_size_reset(struct ifobject *ifobj)
 {
+	if (ifobj->ring.tx_pending == ifobj->set_ring.default_tx &&
+	    ifobj->ring.rx_pending == ifobj->set_ring.default_rx)
+		return 0;
+
 	ifobj->ring.tx_pending = ifobj->set_ring.default_tx;
 	ifobj->ring.rx_pending = ifobj->set_ring.default_rx;
 	return set_ring_size(ifobj);
@@ -203,6 +316,7 @@ static void __test_spec_init(struct test_spec *test, struct ifobject *ifobj_tx,
 
 	for (i = 0; i < MAX_INTERFACES; i++) {
 		struct ifobject *ifobj = i ? ifobj_rx : ifobj_tx;
+		struct ifobject *peer = i ? ifobj_tx : ifobj_rx;
 		struct xsk_umem_info *umem_real;
 
 		ifobj->xsk = &ifobj->xsk_arr[0];
@@ -236,17 +350,23 @@ static void __test_spec_init(struct test_spec *test, struct ifobject *ifobj_tx,
 			else
 				xsk->pkt_stream = test->rx_pkt_stream_default;
 
-			memcpy(xsk->src_mac, g_mac, ETH_ALEN);
-			memcpy(xsk->dst_mac, g_mac, ETH_ALEN);
-			xsk->src_mac[5] += ((j * 2) + 0);
-			xsk->dst_mac[5] += ((j * 2) + 1);
+			if (ifobj_has_cap(ifobj, XSK_CAP_MAC_FILTER) ||
+			    ifobj_has_cap(peer, XSK_CAP_MAC_FILTER)) {
+				memcpy(xsk->src_mac, ifobj->caps.mac, ETH_ALEN);
+				memcpy(xsk->dst_mac, peer->caps.mac, ETH_ALEN);
+			} else {
+				memcpy(xsk->src_mac, g_mac, ETH_ALEN);
+				memcpy(xsk->dst_mac, g_mac, ETH_ALEN);
+				xsk->src_mac[5] += ((j * 2) + 0);
+				xsk->dst_mac[5] += ((j * 2) + 1);
+			}
 		}
 
 		ifobj->xsk->umem->num_frames = DEFAULT_UMEM_BUFFERS;
 		ifobj->xsk->umem->frame_size = XSK_UMEM__DEFAULT_FRAME_SIZE;
 	}
 
-	if (ifobj_has_cap(ifobj_tx, XSK_CAP_HW_RING))
+	if (ifobj_has_cap(ifobj_tx, XSK_CAP_HW_RING) && endpoint_owns(ifobj_tx))
 		hw_ring_size_reset(ifobj_tx);
 
 	test->ifobj_tx = ifobj_tx;
@@ -254,7 +374,6 @@ static void __test_spec_init(struct test_spec *test, struct ifobject *ifobj_tx,
 	test->current_step = 0;
 	test->total_steps = 1;
 	test->nb_sockets = 1;
-	test->fail = false;
 	test->set_ring = false;
 	test->adjust_tail = false;
 	test->adjust_tail_support = false;
@@ -322,24 +441,32 @@ static void test_spec_set_xdp_prog(struct test_spec *test, struct bpf_program *x
 	test->xskmap_tx = xskmap_tx;
 }
 
+static int test_spec_set_mtu_ifobj(struct ifobject *ifobj, int mtu)
+{
+	int err;
+
+	if (ifobj->mtu == mtu)
+		return 0;
+
+	if (endpoint_owns(ifobj)) {
+		err = xsk_set_mtu(ifobj->ifindex, mtu);
+		if (err)
+			return err;
+	}
+
+	ifobj->mtu = mtu;
+	return 0;
+}
+
 static int test_spec_set_mtu(struct test_spec *test, int mtu)
 {
 	int err;
 
-	if (test->ifobj_rx->mtu != mtu) {
-		err = xsk_set_mtu(test->ifobj_rx->ifindex, mtu);
-		if (err)
-			return err;
-		test->ifobj_rx->mtu = mtu;
-	}
-	if (test->ifobj_tx->mtu != mtu) {
-		err = xsk_set_mtu(test->ifobj_tx->ifindex, mtu);
-		if (err)
-			return err;
-		test->ifobj_tx->mtu = mtu;
-	}
+	err = test_spec_set_mtu_ifobj(test->ifobj_rx, mtu);
+	if (err)
+		return err;
 
-	return 0;
+	return test_spec_set_mtu_ifobj(test->ifobj_tx, mtu);
 }
 
 void pkt_stream_reset(struct pkt_stream *pkt_stream)
@@ -624,7 +751,7 @@ static void pkt_stream_cancel(struct pkt_stream *pkt_stream)
 }
 
 static void pkt_generate(struct xsk_socket_info *xsk, struct xsk_umem_info *umem, u64 addr, u32 len,
-			 u32 pkt_nb, u32 bytes_written)
+			 u32 total_len, u32 pkt_nb, u32 bytes_written)
 {
 	void *data = xsk_umem__get_data(umem->buffer, addr);
 
@@ -632,12 +759,12 @@ static void pkt_generate(struct xsk_socket_info *xsk, struct xsk_umem_info *umem
 		return;
 
 	if (!bytes_written) {
-		gen_eth_hdr(xsk, data);
+		gen_pkt_hdr(xsk, data, total_len);
 
-		len -= PKT_HDR_SIZE;
-		data += PKT_HDR_SIZE;
+		len -= pkt_hdr_size;
+		data += pkt_hdr_size;
 	} else {
-		bytes_written -= PKT_HDR_SIZE;
+		bytes_written -= pkt_hdr_size;
 	}
 
 	write_payload(data, pkt_nb, bytes_written, len);
@@ -740,7 +867,7 @@ static void pkt_dump(void *pkt, u32 len, bool eth_header)
 		for (i = 0; i < ETH_ALEN; i++)
 			ksft_print_msg("%02X", ethhdr->h_source[i]);
 
-		data = pkt + PKT_HDR_SIZE;
+		data = pkt + pkt_hdr_size;
 	} else {
 		data = pkt;
 	}
@@ -839,11 +966,15 @@ static bool is_frag_valid(struct xsk_umem_info *umem, u64 addr, u32 len, u32 exp
 
 	pkt_data = data;
 	if (!bytes_processed) {
-		pkt_data += PKT_HDR_SIZE / sizeof(*pkt_data);
-		len -= PKT_HDR_SIZE;
+		if (len < pkt_hdr_size + sizeof(*pkt_data))
+			return false;
+		pkt_data += pkt_hdr_size / sizeof(*pkt_data);
+		len -= pkt_hdr_size;
 	} else {
-		bytes_processed -= PKT_HDR_SIZE;
+		bytes_processed -= pkt_hdr_size;
 	}
+	if (len < sizeof(*pkt_data))
+		return false;
 
 	expected_seqnum = bytes_processed / sizeof(*pkt_data);
 	seqnum = ntohl(*pkt_data) & 0xffff;
@@ -934,6 +1065,7 @@ int kick_tx(struct xsk_socket_info *xsk)
 		usleep(100);
 		return TEST_PASS;
 	}
+	ksft_print_msg("[%s] sendto failed: %s\n", __func__, strerror(errno));
 	return TEST_FAILURE;
 }
 
@@ -942,8 +1074,10 @@ int kick_rx(struct xsk_socket_info *xsk)
 	int ret;
 
 	ret = recvfrom(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
-	if (ret < 0)
+	if (ret < 0) {
+		ksft_print_msg("[%s] recvfrom failed: %s\n", __func__, strerror(errno));
 		return TEST_FAILURE;
+	}
 
 	return TEST_PASS;
 }
@@ -992,6 +1126,9 @@ static int __receive_pkts(struct test_spec *test, struct xsk_socket_info *xsk)
 
 	fds.fd = xsk_socket__fd(xsk->xsk);
 	fds.events = POLLIN;
+
+	if (pacing_rx_progress(0))
+		return TEST_FAILURE;
 
 	ret = kick_rx(xsk);
 	if (ret)
@@ -1092,9 +1229,8 @@ static int __receive_pkts(struct test_spec *test, struct xsk_socket_info *xsk)
 	if (ifobj->release_rx)
 		xsk_ring_cons__release(&xsk->rx, frags_processed);
 
-	pthread_mutex_lock(&pacing_mutex);
-	pkts_in_flight -= pkts_sent;
-	pthread_mutex_unlock(&pacing_mutex);
+	if (pacing_rx_progress(pkts_sent))
+		return TEST_FAILURE;
 	pkts_sent = 0;
 
 	return TEST_CONTINUE;
@@ -1121,7 +1257,7 @@ bool all_packets_received(struct test_spec *test, struct xsk_socket_info *xsk, u
 
 static int receive_pkts(struct test_spec *test)
 {
-	struct timeval tv_end, tv_now, tv_timeout = {THREAD_TMOUT, 0};
+	struct timeval tv_end, tv_now, tv_timeout = {hw_test ? HW_THREAD_TMOUT : THREAD_TMOUT, 0};
 	DECLARE_BITMAP(bitmap, test->nb_sockets);
 	struct xsk_socket_info *xsk;
 	u32 sock_num = 0;
@@ -1170,6 +1306,9 @@ static int __send_pkts(struct ifobject *ifobject, struct xsk_socket_info *xsk,
 	int ret;
 
 	buffer_len = pkt_get_buffer_len(umem, pkt_stream->max_pkt_len);
+	if (pacing_tx_sync())
+		return TEST_FAILURE;
+
 	/* pkts_in_flight might be negative if many invalid packets are sent */
 	if (pkts_in_flight >= (int)((umem_size(umem) - xsk->batch_size * buffer_len) /
 	    buffer_len) && !test_timeout) {
@@ -1235,8 +1374,8 @@ static int __send_pkts(struct ifobject *ifobject, struct xsk_socket_info *xsk,
 				tx_desc->options = 0;
 			}
 			if (pkt->valid)
-				pkt_generate(xsk, umem, tx_desc->addr, tx_desc->len, pkt->pkt_nb,
-					     bytes_written);
+				pkt_generate(xsk, umem, tx_desc->addr, tx_desc->len, pkt->len,
+					     pkt->pkt_nb, bytes_written);
 			bytes_written += tx_desc->len;
 
 			print_verbose("Tx addr: %llx len: %u options: %u pkt_nb: %u\n",
@@ -1254,9 +1393,7 @@ static int __send_pkts(struct ifobject *ifobject, struct xsk_socket_info *xsk,
 		valid_frags += nb_frags;
 	}
 
-	pthread_mutex_lock(&pacing_mutex);
 	pkts_in_flight += valid_pkts;
-	pthread_mutex_unlock(&pacing_mutex);
 
 	xsk_ring_prod__submit(&xsk->tx, i);
 	xsk->outstanding_tx += valid_frags;
@@ -1285,7 +1422,7 @@ static int __send_pkts(struct ifobject *ifobject, struct xsk_socket_info *xsk,
 
 static int wait_for_tx_completion(struct xsk_socket_info *xsk)
 {
-	struct timeval tv_end, tv_now, tv_timeout = {THREAD_TMOUT, 0};
+	struct timeval tv_end, tv_now, tv_timeout = {hw_test ? HW_THREAD_TMOUT : THREAD_TMOUT, 0};
 	int ret;
 
 	ret = gettimeofday(&tv_now, NULL);
@@ -1332,9 +1469,6 @@ static int send_pkts(struct test_spec *test, struct ifobject *ifobject)
 			ret = __send_pkts(ifobject, &ifobject->xsk_arr[i], test->poll_tmout);
 			if (ret != TEST_CONTINUE)
 				return ret;
-
-			if (test->fail)
-				return TEST_FAILURE;
 
 			if (!test->poll_tmout) {
 				ret = wait_for_tx_completion(&ifobject->xsk_arr[i]);
@@ -1486,6 +1620,18 @@ static int xsk_configure(struct test_spec *test, struct ifobject *ifobject,
 				return ret;
 			usleep(USLEEP_MAX);
 		}
+		if (hw_test && test->mode == TEST_MODE_ZC && endpoint_owns(ifobject)) {
+			struct xdp_options options = {};
+			socklen_t len = sizeof(options);
+			int fd = xsk_socket__fd(ifobject->xsk_arr[i].xsk);
+
+			if (getsockopt(fd, SOL_XDP, XDP_OPTIONS, &options, &len) ||
+			    !(options.flags & XDP_OPTIONS_ZEROCOPY)) {
+				ksft_print_msg("AF_XDP socket on queue %u is not zero-copy\n",
+					       ifobject->queue_id);
+				return -EOPNOTSUPP;
+			}
+		}
 		if (ifobject->busy_poll) {
 			ret = enable_busy_poll(&ifobject->xsk_arr[i]);
 			if (ret)
@@ -1562,18 +1708,26 @@ static int thread_common_ops(struct test_spec *test, struct ifobject *ifobject)
 		ceil_u64(umem_sz, HUGEPAGE_SIZE) * HUGEPAGE_SIZE : umem_sz;
 
 	bufs = mmap(NULL, mmap_sz, PROT_READ | PROT_WRITE, mmap_flags, -1, 0);
-	if (bufs == MAP_FAILED)
+	if (bufs == MAP_FAILED) {
+		ksft_print_msg("Error: UMEM mmap failed: %s\n", strerror(errno));
 		return -errno;
+	}
 
 	umem->mmap_size = mmap_sz;
 
 	ret = xsk_configure_umem(ifobject, umem, bufs, umem_sz);
-	if (ret)
+	if (ret) {
+		ksft_print_msg("Error: UMEM setup failed: %d (%s)\n", ret,
+			       strerror(-ret));
 		return ret;
+	}
 
 	ret = xsk_configure(test, ifobject, umem);
-	if (ret)
+	if (ret) {
+		ksft_print_msg("Error: AF_XDP socket setup failed: %d (%s)\n", ret,
+			       strerror(-ret));
 		return ret;
+	}
 
 	ifobject->xsk = &ifobject->xsk_arr[0];
 
@@ -1582,13 +1736,19 @@ static int thread_common_ops(struct test_spec *test, struct ifobject *ifobject)
 
 	ret = xsk_populate_fill_ring(umem, ifobject->xsk->pkt_stream,
 				     ifobject->use_fill_ring);
-	if (ret)
+	if (ret) {
+		ksft_print_msg("Error: fill ring setup failed: %d (%s)\n", ret,
+			       strerror(-ret));
 		return ret;
+	}
 
 	for (i = 0; i < test->nb_sockets; i++) {
 		ret = xsk_update_xskmap(ifobject->xskmap, ifobject->xsk_arr[i].xsk, i);
-		if (ret)
+		if (ret) {
+			ksft_print_msg("Error: XSK map update failed: %d (%s)\n", ret,
+				       strerror(-ret));
 			return ret;
+		}
 	}
 
 	return 0;
@@ -1655,36 +1815,43 @@ static int testapp_validate_rx_endpoint(struct test_spec *test,
 	return err;
 }
 
-void *worker_testapp_validate_tx(void *arg)
+/* One step of a test as seen by this process; NULL means it only syncs. */
+static int testapp_run_endpoint(struct test_spec *test, struct ifobject *ifobj,
+				bool remote_traffic)
 {
-	struct test_spec *test = arg;
-	int err;
+	enum xsk_endpoint_role role = XSK_ENDPOINT_NONE;
+	u32 step = test->current_step;
+	int err = 0;
 
-	err = testapp_validate_tx_endpoint(test, test->ifobj_tx);
-	if (err)
-		test->fail = true;
+	remote_traffic_active = remote_traffic;
 
-	return NULL;
-}
+	if (ifobj)
+		role = ifobj == test->ifobj_rx ? XSK_ENDPOINT_RX : XSK_ENDPOINT_TX;
+	if (role == XSK_ENDPOINT_RX)
+		err = testapp_prepare_rx_endpoint(test, ifobj);
+	if (err) {
+		ksft_print_msg("RX endpoint setup failed at step %u: %d\n", step, err);
+		xsk_peer_abort(ctrl_peer, step);
+		return err;
+	}
+	err = xsk_peer_ready(ctrl_peer, step);
+	if (err) {
+		ksft_print_msg("Endpoint synchronization failed at step %u: %d (%s)\n",
+			       step, err, strerror(-err));
+		return err;
+	}
 
-void *worker_testapp_validate_rx(void *arg)
-{
-	struct test_spec *test = arg;
-	struct ifobject *ifobject = test->ifobj_rx;
-	int err;
+	if (role == XSK_ENDPOINT_RX)
+		err = testapp_validate_rx_endpoint(test, ifobj);
+	else if (role == XSK_ENDPOINT_TX)
+		err = testapp_validate_tx_endpoint(test, ifobj);
 
-	err = testapp_prepare_rx_endpoint(test, ifobject);
-
-	if (test->use_barrier)
-		pthread_barrier_wait(&barr);
-
-	/* Leave only after the barrier so the peer cannot get stuck. */
-	if (!err)
-		err = testapp_validate_rx_endpoint(test, ifobject);
-	if (err)
-		test->fail = true;
-
-	return NULL;
+	if (err) {
+		ksft_print_msg("%s endpoint traffic failed at step %u: %d\n",
+			       role == XSK_ENDPOINT_RX ? "RX" : "TX", step, err);
+		xsk_peer_abort(ctrl_peer, step);
+	}
+	return err;
 }
 
 static void testapp_clean_xsk_umem(struct ifobject *ifobj)
@@ -1739,13 +1906,17 @@ static int xsk_attach_xdp_progs(struct test_spec *test, struct ifobject *ifobj_r
 {
 	int err = 0;
 
-	if (xdp_prog_changed_rx(test)) {
+	if (endpoint_owns(ifobj_rx) && xdp_prog_changed_rx(test)) {
 		err = xsk_reattach_xdp(ifobj_rx, test->xdp_prog_rx, test->xskmap_rx, test->mode);
 		if (err)
 			return err;
 	}
 
-	if (!ifobj_tx)
+	if (!ifobj_tx || !endpoint_owns(ifobj_tx))
+		return 0;
+
+	/* A ZC driver can require XDP to be enabled for TX wakeups. */
+	if (hw_test && !ifobj_tx->rx_on && test->mode != TEST_MODE_ZC)
 		return 0;
 
 	if (xdp_prog_changed_tx(test))
@@ -1758,7 +1929,7 @@ static void clean_sockets(struct test_spec *test, struct ifobject *ifobj)
 {
 	u32 i;
 
-	if (!ifobj || !test)
+	if (!ifobj || !test || !endpoint_owns(ifobj))
 		return;
 
 	for (i = 0; i < test->nb_sockets; i++)
@@ -1770,15 +1941,16 @@ static void clean_umem(struct test_spec *test, struct ifobject *ifobj1, struct i
 	if (!ifobj1)
 		return;
 
-	testapp_clean_xsk_umem(ifobj1);
-	if (ifobj2)
+	if (endpoint_owns(ifobj1))
+		testapp_clean_xsk_umem(ifobj1);
+	if (ifobj2 && endpoint_owns(ifobj2))
 		testapp_clean_xsk_umem(ifobj2);
 }
 
 static int __testapp_validate_traffic(struct test_spec *test, struct ifobject *ifobj1,
 				      struct ifobject *ifobj2)
 {
-	pthread_t t0, t1;
+	struct ifobject *owned = NULL;
 	int err;
 
 	if (test->mtu > MAX_ETH_PKT_SIZE) {
@@ -1807,51 +1979,25 @@ static int __testapp_validate_traffic(struct test_spec *test, struct ifobject *i
 			       err, strerror(-err));
 		return TEST_FAILURE;
 	}
-	test->use_barrier = !!ifobj2;
 
-	if (test->use_barrier) {
-		if (pthread_barrier_init(&barr, NULL, 2))
-			return TEST_FAILURE;
-
+	if (ifobj2)
 		pkt_stream_reset(ifobj2->xsk->pkt_stream);
-	}
-
 	test->current_step++;
 	pkt_stream_reset(ifobj1->xsk->pkt_stream);
 	pkts_in_flight = 0;
 
-	/*Spawn RX thread */
-	pthread_create(&t0, NULL, ifobj1->func_ptr, test);
-
-	if (test->use_barrier) {
-		pthread_barrier_wait(&barr);
-		if (pthread_barrier_destroy(&barr)) {
-			test->use_barrier = false;
-			pthread_join(t0, NULL);
-			clean_sockets(test, ifobj1);
-			clean_umem(test, ifobj1, NULL);
-			return TEST_FAILURE;
-		}
-	}
-
-	if (ifobj2) {
-		/*Spawn TX thread */
-		pthread_create(&t1, NULL, ifobj2->func_ptr, test);
-		pthread_join(t1, NULL);
-	}
-
-	pthread_join(t0, NULL);
-
-	if (test->total_steps == test->current_step || test->fail) {
+	if (endpoint_owns(ifobj1))
+		owned = ifobj1;
+	else if (ifobj2 && endpoint_owns(ifobj2))
+		owned = ifobj2;
+	err = testapp_run_endpoint(test, owned, ifobj2 != NULL);
+	if (test->total_steps == test->current_step || err) {
 		clean_sockets(test, ifobj1);
 		clean_sockets(test, ifobj2);
 		clean_umem(test, ifobj1, ifobj2);
 	}
 
-	if (test->fail)
-		return TEST_FAILURE;
-
-	return TEST_PASS;
+	return err ? TEST_FAILURE : TEST_PASS;
 }
 
 static int testapp_validate_traffic(struct test_spec *test)
@@ -1867,7 +2013,7 @@ static int testapp_validate_traffic(struct test_spec *test)
 
 	if (test->set_ring) {
 		if (ifobj_has_cap(ifobj_tx, XSK_CAP_HW_RING)) {
-			if (set_ring_size(ifobj_tx)) {
+			if (endpoint_owns(ifobj_tx) && set_ring_size(ifobj_tx)) {
 				ksft_print_msg("Failed to change HW ring size.\n");
 				return TEST_FAILURE;
 			}
@@ -1900,11 +2046,7 @@ int testapp_teardown(struct test_spec *test)
 
 static void swap_directions(struct ifobject **ifobj1, struct ifobject **ifobj2)
 {
-	thread_func_t tmp_func_ptr = (*ifobj1)->func_ptr;
 	struct ifobject *tmp_ifobj = (*ifobj1);
-
-	(*ifobj1)->func_ptr = (*ifobj2)->func_ptr;
-	(*ifobj2)->func_ptr = tmp_func_ptr;
 
 	*ifobj1 = *ifobj2;
 	*ifobj2 = tmp_ifobj;
@@ -1938,6 +2080,9 @@ static int swap_xsk_resources(struct test_spec *test)
 	test->ifobj_rx->xsk_arr[1].pkt_stream = test->rx_pkt_stream_default;
 	test->ifobj_tx->xsk = &test->ifobj_tx->xsk_arr[1];
 	test->ifobj_rx->xsk = &test->ifobj_rx->xsk_arr[1];
+
+	if (!endpoint_owns(test->ifobj_rx))
+		return TEST_PASS;
 
 	ret = xsk_update_xskmap(test->ifobj_rx->xskmap, test->ifobj_rx->xsk->xsk, 0);
 	if (ret)
@@ -2187,9 +2332,17 @@ int testapp_xdp_metadata_copy(struct test_spec *test)
 
 int testapp_xdp_shared_umem(struct test_spec *test)
 {
-	struct xsk_xdp_progs *skel_rx = test->ifobj_rx->xdp_progs;
-	struct xsk_xdp_progs *skel_tx = test->ifobj_tx->xdp_progs;
+	struct xsk_xdp_progs *skel_rx;
+	struct xsk_xdp_progs *skel_tx;
 	int ret;
+
+	/* The XDP program picks the socket from the synthetic destination MAC. */
+	if (ifobj_has_cap(test->ifobj_rx, XSK_CAP_MAC_FILTER) ||
+	    ifobj_has_cap(test->ifobj_tx, XSK_CAP_MAC_FILTER))
+		return TEST_SKIP;
+
+	skel_rx = test->ifobj_rx->xdp_progs;
+	skel_tx = test->ifobj_tx->xdp_progs;
 
 	test->total_steps = 1;
 	test->nb_sockets = 2;
@@ -2233,7 +2386,9 @@ int testapp_too_many_frags(struct test_spec *test)
 	u32 max_frags, i;
 	int ret = TEST_FAILURE;
 
-	if (test->mode == TEST_MODE_ZC) {
+	if (max_frags_override) {
+		max_frags = max_frags_override;
+	} else if (test->mode == TEST_MODE_ZC) {
 		max_frags = test->ifobj_tx->caps.xdp_zc_max_segs;
 	} else {
 		max_frags = test->ifobj_tx->caps.max_skb_frags;
@@ -2287,7 +2442,7 @@ int testapp_too_many_frags(struct test_spec *test)
 	return ret;
 }
 
-static int xsk_load_xdp_programs(struct ifobject *ifobj)
+int xsk_load_xdp_programs(struct ifobject *ifobj)
 {
 	ifobj->xdp_progs = xsk_xdp_progs__open_and_load();
 	if (libbpf_get_error(ifobj->xdp_progs))
@@ -2312,12 +2467,10 @@ static bool hugepages_present(void)
 	return true;
 }
 
-int init_iface(struct ifobject *ifobj, thread_func_t func_ptr)
+int init_iface(struct ifobject *ifobj)
 {
 	LIBBPF_OPTS(bpf_xdp_query_opts, query_opts);
 	int err;
-
-	ifobj->func_ptr = func_ptr;
 
 	err = xsk_load_xdp_programs(ifobj);
 	if (err) {
@@ -2342,6 +2495,7 @@ int init_iface(struct ifobject *ifobj, thread_func_t func_ptr)
 	if (query_opts.feature_flags & NETDEV_XDP_ACT_RX_SG)
 		ifobj->caps.flags |= XSK_CAP_MULTI_BUFF;
 	if (query_opts.feature_flags & NETDEV_XDP_ACT_XSK_ZEROCOPY) {
+		ifobj->caps.flags |= XSK_CAP_ZC_ADVERTISED;
 		if (query_opts.xdp_zc_max_segs > 1) {
 			ifobj->caps.flags |= XSK_CAP_MULTI_BUFF_ZC;
 			ifobj->caps.xdp_zc_max_segs = query_opts.xdp_zc_max_segs;

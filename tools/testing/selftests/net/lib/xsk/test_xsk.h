@@ -35,7 +35,6 @@
 #define SMP_CACHE_BYTES_PATH "/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size"
 
 extern bool opt_verbose;
-extern int pkts_in_flight;
 #define print_verbose(x...) do { if (opt_verbose) ksft_print_msg(x); } while (0)
 
 
@@ -78,8 +77,26 @@ enum test_mode {
 struct ifobject;
 struct test_spec;
 typedef int (*validation_func_t)(struct ifobject *ifobj);
-typedef void *(*thread_func_t)(void *arg);
 typedef int (*test_func_t)(struct test_spec *test);
+
+enum xsk_endpoint_role {
+	XSK_ENDPOINT_NONE,
+	XSK_ENDPOINT_RX,
+	XSK_ENDPOINT_TX,
+};
+
+#define XSK_HW_RX (1U << 0)
+#define XSK_HW_TX (1U << 1)
+
+struct xsk_peer;
+
+/* The interface this process drives and the control channel to the other one. */
+void xsk_set_endpoint(struct xsk_peer *peer, struct ifobject *owned, bool hw_test);
+int xsk_set_udp_packet_format(const char *src_ip, const char *dst_ip, u16 port);
+void xsk_set_max_frags(u32 max_frags);
+
+/* Packets TX has sent that RX has not yet reported consumed. */
+extern int pkts_in_flight;
 
 struct xsk_socket_info {
 	struct xsk_ring_cons rx;
@@ -128,8 +145,11 @@ int hw_ring_size_reset(struct ifobject *ifobj);
 #define XSK_CAP_MULTI_BUFF       (1U << 3)
 #define XSK_CAP_MULTI_BUFF_ZC    (1U << 4)
 #define XSK_CAP_HW_RING          (1U << 5)
+/* Frames must carry the real interface MACs to reach the peer. */
+#define XSK_CAP_MAC_FILTER       (1U << 6)
+#define XSK_CAP_ZC_ADVERTISED    (1U << 7)
 
-/* Sized in u32 words so the peer control channel can carry it verbatim. */
+/* Per-interface capabilities; the traffic peer does not negotiate them. */
 struct xsk_caps {
 	u32 flags;
 	u32 xdp_zc_max_segs;
@@ -145,7 +165,6 @@ struct ifobject {
 	struct xsk_caps caps;
 	struct xsk_socket_info *xsk;
 	struct xsk_socket_info *xsk_arr;
-	thread_func_t func_ptr;
 	validation_func_t validation_func;
 	struct xsk_xdp_progs *xdp_progs;
 	struct bpf_map *xskmap;
@@ -154,6 +173,7 @@ struct ifobject {
 	struct set_hw_ring set_ring;
 	enum test_mode mode;
 	int ifindex;
+	u32 queue_id;
 	int mtu;
 	u32 bind_flags;
 	bool tx_on;
@@ -172,7 +192,8 @@ static inline bool ifobj_has_cap(const struct ifobject *ifobj, u32 cap)
 
 struct ifobject *ifobject_create(void);
 void ifobject_delete(struct ifobject *ifobj);
-int init_iface(struct ifobject *ifobj, thread_func_t func_ptr);
+int init_iface(struct ifobject *ifobj);
+int xsk_load_xdp_programs(struct ifobject *ifobj);
 
 int xsk_configure_umem(struct ifobject *ifobj, struct xsk_umem_info *umem, void *buffer, u64 size);
 int xsk_configure_socket(struct xsk_socket_info *xsk, struct xsk_umem_info *umem,
@@ -217,16 +238,16 @@ struct test_spec {
 	struct bpf_map *xskmap_rx;
 	struct bpf_map *xskmap_tx;
 	test_func_t test_func;
+	/* DUT roles in which this case exercises hardware zero-copy. */
+	u8 hw_directions;
 	int mtu;
 	u16 total_steps;
 	u16 current_step;
 	u16 nb_sockets;
-	bool fail;
 	bool set_ring;
 	bool adjust_tail;
 	bool adjust_tail_support;
 	bool poll_tmout;
-	bool use_barrier;
 	enum test_mode mode;
 	char name[MAX_TEST_NAME_SIZE];
 };
@@ -287,32 +308,41 @@ int testapp_xdp_metadata_mb(struct test_spec *test);
 int testapp_xdp_prog_cleanup(struct test_spec *test);
 int testapp_xdp_shared_umem(struct test_spec *test);
 
-void *worker_testapp_validate_rx(void *arg);
-void *worker_testapp_validate_tx(void *arg);
-
 static const struct test_spec tests[] = {
-	{.name = "SEND_RECEIVE", .test_func = testapp_send_receive},
-	{.name = "SEND_RECEIVE_2K_FRAME", .test_func = testapp_send_receive_2k_frame},
-	{.name = "SEND_RECEIVE_SINGLE_PKT", .test_func = testapp_single_pkt},
-	{.name = "POLL_RX", .test_func = testapp_poll_rx},
-	{.name = "POLL_TX", .test_func = testapp_poll_tx},
-	{.name = "POLL_RXQ_FULL", .test_func = testapp_poll_rxq_tmout},
-	{.name = "POLL_TXQ_FULL", .test_func = testapp_poll_txq_tmout},
-	{.name = "ALIGNED_INV_DESC", .test_func = testapp_aligned_inv_desc},
-	{.name = "ALIGNED_INV_DESC_2K_FRAME_SIZE", .test_func = testapp_aligned_inv_desc_2k_frame},
-	{.name = "UMEM_HEADROOM", .test_func = testapp_headroom},
+	{.name = "SEND_RECEIVE", .test_func = testapp_send_receive,
+	 .hw_directions = XSK_HW_RX | XSK_HW_TX},
+	{.name = "SEND_RECEIVE_2K_FRAME", .test_func = testapp_send_receive_2k_frame,
+	 .hw_directions = XSK_HW_RX | XSK_HW_TX},
+	{.name = "SEND_RECEIVE_SINGLE_PKT", .test_func = testapp_single_pkt,
+	 .hw_directions = XSK_HW_RX | XSK_HW_TX},
+	{.name = "POLL_RX", .test_func = testapp_poll_rx, .hw_directions = XSK_HW_RX},
+	{.name = "POLL_TX", .test_func = testapp_poll_tx, .hw_directions = XSK_HW_TX},
+	{.name = "POLL_RXQ_FULL", .test_func = testapp_poll_rxq_tmout,
+	 .hw_directions = XSK_HW_RX},
+	{.name = "POLL_TXQ_FULL", .test_func = testapp_poll_txq_tmout,
+	 .hw_directions = XSK_HW_TX},
+	{.name = "ALIGNED_INV_DESC", .test_func = testapp_aligned_inv_desc,
+	 .hw_directions = XSK_HW_TX},
+	{.name = "ALIGNED_INV_DESC_2K_FRAME_SIZE",
+	 .test_func = testapp_aligned_inv_desc_2k_frame, .hw_directions = XSK_HW_TX},
+	{.name = "UMEM_HEADROOM", .test_func = testapp_headroom, .hw_directions = XSK_HW_RX},
 	{.name = "BIDIRECTIONAL", .test_func = testapp_bidirectional},
 	{.name = "STAT_RX_DROPPED", .test_func = testapp_stats_rx_dropped},
-	{.name = "STAT_TX_INVALID", .test_func = testapp_stats_tx_invalid_descs},
+	{.name = "STAT_TX_INVALID", .test_func = testapp_stats_tx_invalid_descs,
+	 .hw_directions = XSK_HW_TX},
 	{.name = "STAT_RX_FULL", .test_func = testapp_stats_rx_full},
 	{.name = "STAT_FILL_EMPTY", .test_func = testapp_stats_fill_empty},
-	{.name = "XDP_PROG_CLEANUP", .test_func = testapp_xdp_prog_cleanup},
+	{.name = "XDP_PROG_CLEANUP", .test_func = testapp_xdp_prog_cleanup,
+	 .hw_directions = XSK_HW_RX},
 	{.name = "XDP_DROP_HALF", .test_func = testapp_xdp_drop},
 	{.name = "XDP_SHARED_UMEM", .test_func = testapp_xdp_shared_umem},
-	{.name = "XDP_METADATA_COPY", .test_func = testapp_xdp_metadata},
+	{.name = "XDP_METADATA_COPY", .test_func = testapp_xdp_metadata,
+	 .hw_directions = XSK_HW_RX},
 	{.name = "XDP_METADATA_COPY_MULTI_BUFF", .test_func = testapp_xdp_metadata_mb},
-	{.name = "ALIGNED_INV_DESC_MULTI_BUFF", .test_func = testapp_aligned_inv_desc_mb},
-	{.name = "TOO_MANY_FRAGS", .test_func = testapp_too_many_frags},
+	{.name = "ALIGNED_INV_DESC_MULTI_BUFF", .test_func = testapp_aligned_inv_desc_mb,
+	 .hw_directions = XSK_HW_TX},
+	{.name = "TOO_MANY_FRAGS", .test_func = testapp_too_many_frags,
+	 .hw_directions = XSK_HW_TX},
 	{.name = "XDP_ADJUST_TAIL_SHRINK", .test_func = testapp_adjust_tail_shrink},
 	{.name = "TX_QUEUE_CONSUMER", .test_func = testapp_tx_queue_consumer},
 	};
@@ -322,15 +352,20 @@ static const struct test_spec ci_skip_tests[] = {
 	{.name = "XDP_ADJUST_TAIL_SHRINK_MULTI_BUFF", .test_func = testapp_adjust_tail_shrink_mb},
 	{.name = "XDP_ADJUST_TAIL_GROW", .test_func = testapp_adjust_tail_grow},
 	{.name = "XDP_ADJUST_TAIL_GROW_MULTI_BUFF", .test_func = testapp_adjust_tail_grow_mb},
-	{.name = "SEND_RECEIVE_9K_PACKETS", .test_func = testapp_send_receive_mb},
+	{.name = "SEND_RECEIVE_9K_PACKETS", .test_func = testapp_send_receive_mb,
+	 .hw_directions = XSK_HW_RX | XSK_HW_TX},
 	/* Tests with huge page dependency */
-	{.name = "SEND_RECEIVE_UNALIGNED", .test_func = testapp_send_receive_unaligned},
-	{.name = "UNALIGNED_INV_DESC", .test_func = testapp_unaligned_inv_desc},
+	{.name = "SEND_RECEIVE_UNALIGNED", .test_func = testapp_send_receive_unaligned,
+	 .hw_directions = XSK_HW_RX | XSK_HW_TX},
+	{.name = "UNALIGNED_INV_DESC", .test_func = testapp_unaligned_inv_desc,
+	 .hw_directions = XSK_HW_TX},
 	{.name = "UNALIGNED_INV_DESC_4001_FRAME_SIZE",
-	 .test_func = testapp_unaligned_inv_desc_4001_frame},
+	 .test_func = testapp_unaligned_inv_desc_4001_frame, .hw_directions = XSK_HW_TX},
 	{.name = "SEND_RECEIVE_UNALIGNED_9K_PACKETS",
-	 .test_func = testapp_send_receive_unaligned_mb},
-	{.name = "UNALIGNED_INV_DESC_MULTI_BUFF", .test_func = testapp_unaligned_inv_desc_mb},
+	 .test_func = testapp_send_receive_unaligned_mb,
+	 .hw_directions = XSK_HW_RX | XSK_HW_TX},
+	{.name = "UNALIGNED_INV_DESC_MULTI_BUFF", .test_func = testapp_unaligned_inv_desc_mb,
+	 .hw_directions = XSK_HW_TX},
 	/* Test with HW ring size dependency */
 	{.name = "HW_SW_MIN_RING_SIZE", .test_func = testapp_hw_sw_min_ring_size},
 	{.name = "HW_SW_MAX_RING_SIZE", .test_func = testapp_hw_sw_max_ring_size},

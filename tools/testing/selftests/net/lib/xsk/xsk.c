@@ -397,7 +397,7 @@ int xsk_set_mtu(int ifindex, int mtu)
 
 	fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
 	if (fd < 0)
-		return fd;
+		return -errno;
 
 	memset(&req, 0, sizeof(req));
 	req.nh.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
@@ -413,8 +413,9 @@ int xsk_set_mtu(int ifindex, int mtu)
 
 	ret = send(fd, &req, req.nh.nlmsg_len, 0);
 	if (ret < 0) {
+		ret = -errno;
 		close(fd);
-		return errno;
+		return ret;
 	}
 
 	ret = netlink_recv(fd);
@@ -802,6 +803,31 @@ int xsk_get_hw_ring_size(const char *ifname, struct ethtool_ringparam *ring)
 	return 0;
 }
 
+int xsk_get_driver(const char *ifname, char *driver, size_t len)
+{
+	struct ethtool_drvinfo info = { .cmd = ETHTOOL_GDRVINFO };
+	struct ifreq ifr = {};
+	int fd, err;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -errno;
+
+	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+	ifr.ifr_data = (char *)&info;
+
+	if (ioctl(fd, SIOCETHTOOL, &ifr) < 0) {
+		err = -errno;
+		close(fd);
+		return err;
+	}
+
+	close(fd);
+	strncpy(driver, info.driver, len - 1);
+	driver[len - 1] = '\0';
+	return 0;
+}
+
 int xsk_get_mac(const char *ifname, u8 mac[ETH_ALEN])
 {
 	struct ifreq ifr = {};
@@ -820,6 +846,27 @@ int xsk_get_mac(const char *ifname, u8 mac[ETH_ALEN])
 
 	close(fd);
 	memcpy(mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+	return 0;
+}
+
+int xsk_get_mtu(const char *ifname, int *mtu)
+{
+	struct ifreq ifr = {};
+	int fd, err;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -errno;
+
+	strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+	if (ioctl(fd, SIOCGIFMTU, &ifr) < 0) {
+		err = -errno;
+		close(fd);
+		return err;
+	}
+
+	close(fd);
+	*mtu = ifr.ifr_mtu;
 	return 0;
 }
 
