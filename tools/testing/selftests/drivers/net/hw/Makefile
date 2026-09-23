@@ -13,6 +13,25 @@ else
 $(warning excluding iouring tests, liburing not installed or too old)
 endif
 
+XSK_NET_OUTPUT = $(abspath $(OUTPUT)/.xsk-net)
+EXTRA_CLEAN += $(XSK_NET_OUTPUT)
+
+# xsk.py may copy xskxceiver to a host with an older libc.  Prefer a
+# static binary when the required archives are installed.  XSK_STATIC=0/1
+# can be used to override the probe.
+PKG_CONFIG ?= $(CROSS_COMPILE)pkg-config
+XSK_STATIC_LIBS := $(shell $(PKG_CONFIG) libelf --static --libs 2>/dev/null || echo -lelf -lz -lzstd)
+XSK_STATIC ?= $(shell echo 'int main(void) { return 0; }' | \
+	$(CC) -x c - -static $(XSK_STATIC_LIBS) -lz -o /dev/null 2>/dev/null && echo 1)
+
+BPFTOOL ?= bpftool
+HAS_BPFTOOL := $(shell command -v $(BPFTOOL) >/dev/null 2>&1 && echo y)
+ifeq ($(HAS_BPFTOOL),y)
+COND_GEN_FILES += xskxceiver
+else
+$(warning excluding xskxceiver test, bpftool not found)
+endif
+
 TEST_GEN_FILES := \
 	$(COND_GEN_FILES) \
 # end of TEST_GEN_FILES
@@ -50,6 +69,7 @@ TEST_PROGS = \
 	userns_devmem.py \
 	uso.py \
 	xdp_metadata.py \
+	xsk.py \
 	xsk_reconfig.py \
 	#
 
@@ -93,3 +113,15 @@ include ../../../net/bpf.mk
 ifeq ($(HAS_IOURING_ZCRX),y)
 $(OUTPUT)/iou-zcrx: LDLIBS += -luring
 endif
+
+# The generic AF_XDP suite and its build live in selftests/net.
+$(OUTPUT)/xskxceiver: FORCE
+	$(Q)mkdir -p $(XSK_NET_OUTPUT)
+	+$(Q)$(MAKE) -C ../../../net OUTPUT=$(XSK_NET_OUTPUT) BPFTOOL=$(BPFTOOL) \
+		XSK_STATIC=$(XSK_STATIC) $(XSK_NET_OUTPUT)/xskxceiver
+	$(Q)cp $(XSK_NET_OUTPUT)/xskxceiver $@
+
+.PHONY: FORCE xskxceiver
+xskxceiver: $(OUTPUT)/xskxceiver
+
+FORCE:
